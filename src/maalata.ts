@@ -141,6 +141,10 @@ export class CanvasRenderer {
     };
   }
 
+  public updateCRTConfig(config: Partial<CRTConfig>): void {
+    if (this._crtDisplay) this._crtDisplay.updateConfig(config);
+  }
+
   public screenshot(): Promise<ImageBitmap> {
     // Trigger a synchronous CRT render so the canvas has the latest frame
     if (this._crtDisplay) {

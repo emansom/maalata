@@ -40,6 +40,8 @@ export interface CRTConfig {
   bfiStrength: number;
   bfiTargetHz: number;
   bfiGainVsBlur: number;
+  crtGamma: number;
+  displayGamma: number;
 }
 
 const _DEFAULT_CRT_CONFIG: CRTConfig = {
@@ -53,7 +55,7 @@ const _DEFAULT_CRT_CONFIG: CRTConfig = {
   retraceLines: true,
   scanlineIntensity: 0.6,
   dotMask: false,
-  brightness: 0.9,
+  brightness: 1.0,
   contrast: 1.0,
   desaturation: 0.2,
   flicker: 0.01,
@@ -63,6 +65,8 @@ const _DEFAULT_CRT_CONFIG: CRTConfig = {
   bfiStrength: 0,
   bfiTargetHz: 60,
   bfiGainVsBlur: 0.7,
+  crtGamma: 2.4,
+  displayGamma: 2.2,
 };
 
 interface _CRTUniforms {
@@ -87,6 +91,8 @@ interface _CRTUniforms {
   _bfiPhase: WebGLUniformLocation | null;
   _bfiFramesPerHz: WebGLUniformLocation | null;
   _bfiGainVsBlur: WebGLUniformLocation | null;
+  _crtGamma: WebGLUniformLocation | null;
+  _displayGamma: WebGLUniformLocation | null;
 }
 
 export class CRTDisplay {
@@ -228,6 +234,11 @@ export class CRTDisplay {
     }
   }
 
+  /** Update CRT config at runtime (partial merge with defaults). */
+  updateConfig(config: Partial<CRTConfig>): void {
+    this._setCRTConfig(config);
+  }
+
   /** Clean up resources. */
   destroy(): void {
     this.stop();
@@ -282,6 +293,8 @@ export class CRTDisplay {
       _bfiPhase:          gl.getUniformLocation(program, 'u_bfiPhase'),
       _bfiFramesPerHz:    gl.getUniformLocation(program, 'u_bfiFramesPerHz'),
       _bfiGainVsBlur:     gl.getUniformLocation(program, 'u_bfiGainVsBlur'),
+      _crtGamma:          gl.getUniformLocation(program, 'u_crtGamma'),
+      _displayGamma:      gl.getUniformLocation(program, 'u_displayGamma'),
     };
   }
 
@@ -305,6 +318,8 @@ export class CRTDisplay {
     gl.uniform1f(u._signalLoss!, c.signalLoss);
     gl.uniform1f(u._scanlineCount!, c.scanlineCount);
     gl.uniform1f(u._vignetteStrength!, c.vignetteStrength);
+    gl.uniform1f(u._crtGamma!, c.crtGamma);
+    gl.uniform1f(u._displayGamma!, c.displayGamma);
 
     // Backward compatibility: boolean retraceLines controls scanlineIntensity
     // When retraceLines is false, zero out scanline intensity to disable the effect

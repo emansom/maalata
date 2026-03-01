@@ -59,12 +59,14 @@ export const CRT_VERTEX_SRC = `
  *  2. Vertical jitter (UV offset, conditional)
  *  3. Horizontal tearing (UV offset, conditional)
  *  4. Texture sampling — 4-way: BFI×aberration (1/3/3/9 reads)
- *  5. Static noise (conditional)
- *  6. Glow/bloom (conditional)
- *  7. Signal loss (conditional)
- *  8. Combined lighting mask: scanlines + flicker + vignette → single multiply
- *  9. Dot mask (conditional, float intensity)
- * 10. Color: desaturation → contrast → brightness
+ *  5. Linearize with CRT gamma (2.4, BT.1886)
+ *  6. Static noise (linear)
+ *  7. Glow/bloom (linear, adjusted threshold)
+ *  8. Signal loss (linear)
+ *  9. Combined lighting mask: scanlines + flicker + vignette (linear)
+ * 10. Dot mask (linear)
+ * 11. Encode with display gamma (2.2, sRGB)
+ * 12. Color: desaturation → contrast → brightness (perceptual)
  */
 export const CRT_FRAGMENT_SRC = `
   // gingerbeardman: highp precision selection for better quality on capable GPUs
@@ -95,6 +97,10 @@ export const CRT_FRAGMENT_SRC = `
   uniform float u_dotMask;
   uniform float u_vignetteStrength;
 
+  // CRT gamma pipeline: BT.1886 decode + sRGB encode
+  uniform float u_crtGamma;      // CRT native gamma (default 2.4, BT.1886)
+  uniform float u_displayGamma;  // Display output gamma (default 2.2, sRGB)
+
   // Blur Busters: BFI rolling scan uniforms
   uniform sampler2D u_framePrev2;    // 2 CRT cycles ago
   uniform sampler2D u_framePrev1;    // 1 CRT cycle ago
@@ -108,6 +114,10 @@ export const CRT_FRAGMENT_SRC = `
   const float BFI_GAMMA = 2.2;
   vec3 bfiToLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(BFI_GAMMA)); }
   vec3 bfiToGamma(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / BFI_GAMMA)); }
+
+  // CRT gamma pipeline helpers
+  vec3 crtLinearize(vec3 c) { return pow(max(c, vec3(0.0)), vec3(u_crtGamma)); }
+  vec3 crtEncode(vec3 c)    { return pow(max(c, vec3(0.0)), vec3(1.0 / u_displayGamma)); }
 
   // Blur Busters rolling scan with phosphor decay + variable MPRT
   // Ported from getPixelFromSimulatedCRT in crt-simulator.glsl
@@ -224,7 +234,10 @@ export const CRT_FRAGMENT_SRC = `
       col = texture2D(u_texture, uv).rgb;
     }
 
-    // --- 5. Static noise (Ichiaka, enhanced with temporal variation) ---
+    // --- 5. Linearize with CRT gamma (BT.1886) ---
+    col = crtLinearize(col);
+
+    // --- 6. Static noise (Ichiaka, enhanced with temporal variation) ---
     // Original used only UV for hash seed, producing a static pattern.
     // Adding u_time makes the noise animate, which is more CRT-authentic.
     if (u_noise > 0.0001) {
@@ -232,26 +245,30 @@ export const CRT_FRAGMENT_SRC = `
       col += (n - 0.5) * u_noise;
     }
 
-    // --- 6. Glow/bloom (Ichiaka) ---
+    // --- 7. Glow/bloom (Ichiaka) ---
     // Cheap smoothstep-based glow. gingerbeardman uses a 5-tap bloom (4 extra
     // texture reads) which we intentionally skip for performance.
+    // Threshold adjusted for linear space: 0.2 linear ≈ 0.5 sRGB
     if (u_glow > 0.0001) {
-      col += u_glow * smoothstep(0.5, 1.0, col);
+      col += u_glow * smoothstep(0.2, 1.0, col);
     }
 
-    // --- 7. Signal loss (Ichiaka) ---
+    // --- 8. Signal loss (Ichiaka) ---
     if (u_signalLoss > 0.0001) {
       col *= 1.0 - (u_signalLoss * abs(sin(uv.y * 50.0 + u_time * 10.0)));
     }
 
-    // --- 8. Combined lighting mask (gingerbeardman pattern) ---
+    // --- 9. Combined lighting mask (gingerbeardman pattern) ---
     // Combine scanlines, flicker, and vignette into a single multiplier.
     // One multiply is cheaper than three separate multiply operations.
     float mask = 1.0;
 
     // Scanlines (Ichiaka effect, gingerbeardman's configurable count pattern)
+    // Fixed: original had 1.9 + intensity*sin() which amplified brightness 1.3-2.5x.
+    // That compensated for a double-multiplication bug in CRTFilter that maalata doesn't have.
+    // New formula: dark lines at (1-intensity), bright lines at 1.0, no amplification.
     if (u_scanlineIntensity > 0.0001) {
-      mask *= 1.9 + u_scanlineIntensity * sin(uv.y * u_scanlineCount + u_time * 10.0);
+      mask *= 1.0 - u_scanlineIntensity * 0.5 * (1.0 - sin(uv.y * u_scanlineCount + u_time * 10.0));
     }
 
     // Flicker (Ichiaka)
@@ -266,7 +283,7 @@ export const CRT_FRAGMENT_SRC = `
 
     col *= mask;
 
-    // --- 9. Dot mask (Ichiaka, converted from bool to float intensity) ---
+    // --- 10. Dot mask (Ichiaka, converted from bool to float intensity) ---
     // Original was a bool uniform; now float so it participates in early-out
     // pattern and allows variable intensity.
     if (u_dotMask > 0.0001) {
@@ -278,7 +295,10 @@ export const CRT_FRAGMENT_SRC = `
       col *= mix(vec3(1.0), dotEffect, u_dotMask);
     }
 
-    // --- 10. Color adjustments (Ichiaka) ---
+    // --- 11. Encode with display gamma (sRGB) ---
+    col = crtEncode(col);
+
+    // --- 12. Color adjustments (Ichiaka, perceptual/gamma-encoded space) ---
     // Desaturation
     if (u_desaturation > 0.0001) {
       float lum = dot(col, vec3(0.299, 0.587, 0.114));

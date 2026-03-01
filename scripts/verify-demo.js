@@ -27,6 +27,7 @@ const BUTTONS = {
   drawStatic:     { x: 95, y: 80  },
   startAnimation: { x: 95, y: 140 },
   stopAnimation:  { x: 95, y: 200 },
+  testPattern:    { x: 95, y: 260 },
 };
 
 // Visual verification: sample canvas pixels during animation
@@ -85,6 +86,76 @@ async function sampleCanvasPixels(page) {
     return { total, dark, green, magenta, orange, blue };
   }, base64);
   /* eslint-enable no-undef */
+}
+
+/**
+ * Neutral CRT config — disables all effects, gamma cancels out (2.2/2.2 = identity).
+ */
+const NEUTRAL_CRT = {
+  barrelDistortion: 0, curvature: 0, chromaticAberration: 0,
+  staticNoise: 0, horizontalTearing: 0, glowBloom: 0, verticalJitter: 0,
+  retraceLines: false, scanlineIntensity: 0, dotMask: false,
+  brightness: 1.0, contrast: 1.0, desaturation: 0,
+  flicker: 0, signalLoss: 0, vignetteStrength: 0,
+  scanlineCount: 800, bfiStrength: 0,
+  crtGamma: 2.2, displayGamma: 2.2,
+};
+
+/**
+ * Sample average color of a rectangular region from a canvas screenshot.
+ * Crops 20% edge margin to avoid border effects.
+ */
+async function sampleRegionColor(page, x, y, w, h) {
+  const screenshotBuffer = await page.locator('#canvas').screenshot({ type: 'png' });
+  const base64 = screenshotBuffer.toString('base64');
+
+  /* eslint-disable no-undef -- entire callback runs inside Playwright browser context */
+  return page.evaluate(async ({ b64, rx, ry, rw, rh }) => {
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = `data:image/png;base64,${b64}`;
+    });
+    const tmp = document.createElement('canvas');
+    tmp.width = img.width;
+    tmp.height = img.height;
+    const ctx = tmp.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    // 20% edge margin
+    const mx = Math.floor(rw * 0.2);
+    const my = Math.floor(rh * 0.2);
+    const sx = rx + mx;
+    const sy = ry + my;
+    const sw = rw - 2 * mx;
+    const sh = rh - 2 * my;
+
+    const { data } = ctx.getImageData(sx, sy, sw, sh);
+    let rSum = 0, gSum = 0, bSum = 0;
+    const count = sw * sh;
+    for (let i = 0; i < data.length; i += 4) {
+      rSum += data[i];
+      gSum += data[i + 1];
+      bSum += data[i + 2];
+    }
+    return { r: rSum / count, g: gSum / count, b: bSum / count };
+  }, { b64: base64, rx: x, ry: y, rw: w, rh: h });
+  /* eslint-enable no-undef */
+}
+
+/**
+ * Apply CRT config and render test pattern, then wait for pipeline settle.
+ */
+async function applyConfigAndRender(page, config) {
+  /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+  await page.evaluate((cfg) => {
+    window.maalataRenderer.updateCRTConfig(cfg);
+    window.maalataRenderTestPattern();
+  }, config);
+  /* eslint-enable no-undef */
+  // Wait for pipeline settle (4-stage latency pipeline ~168ms + CRT render)
+  await page.waitForTimeout(500);
 }
 
 function spawnServer(distDir, port) {
@@ -280,6 +351,254 @@ async function main() {
     // Click "Stop Animation"
     console.log(`${tag} Clicking "Stop Animation"...`);
     await canvas.click({ position: BUTTONS.stopAnimation });
+    await page.waitForTimeout(500);
+
+    // -----------------------------------------------------------------------
+    // CRT shader tests — test pattern + per-step verification
+    // -----------------------------------------------------------------------
+
+    // Click "Test Pattern"
+    console.log(`\n${tag} Clicking "Test Pattern"...`);
+    await canvas.click({ position: BUTTONS.testPattern });
+    await page.waitForTimeout(500);
+
+    // SMPTE bar geometry (matching demo/src/main.ts)
+    const BARS_X = 200, BARS_Y = 20, BARS_W = 580, BARS_H = 200;
+    const BAR_W = BARS_W / 7;
+    // Grayscale ramp geometry
+    const RAMP_X = 200, RAMP_Y = 240, RAMP_W = 580, RAMP_H = 60;
+    const STEP_W = RAMP_W / 16;
+
+    // --- E2E test: Full pipeline with default config ---
+    console.log(`\n${tag} E2E: SMPTE hue verification (default config)...`);
+    {
+      // Expected SMPTE bars: white, yellow, cyan, green, magenta, red, blue
+      const barExpected = [
+        { name: 'white',   on: [0,1,2], off: [] },
+        { name: 'yellow',  on: [0,1],   off: [2] },
+        { name: 'cyan',    on: [1,2],   off: [0] },
+        { name: 'green',   on: [1],     off: [0,2] },
+        { name: 'magenta', on: [0,2],   off: [1] },
+        { name: 'red',     on: [0],     off: [1,2] },
+        { name: 'blue',    on: [2],     off: [0,1] },
+      ];
+
+      for (let i = 0; i < barExpected.length; i++) {
+        const bx = BARS_X + i * BAR_W;
+        const color = await sampleRegionColor(page, bx, BARS_Y, BAR_W, BARS_H);
+        const channels = [color.r, color.g, color.b];
+        const { name, on: onCh, off: offCh } = barExpected[i];
+
+        // "on" channels must be > 50
+        for (const ch of onCh) {
+          if (channels[ch] < 50) {
+            const msg = `[E2E SMPTE] ${name} bar: "on" channel ${ch} = ${channels[ch].toFixed(0)}, expected > 50`;
+            errors.push(msg);
+            console.error(`${tag} ${msg}`);
+          }
+        }
+        // "off" channels must be < 200
+        for (const ch of offCh) {
+          if (channels[ch] > 200) {
+            const msg = `[E2E SMPTE] ${name} bar: "off" channel ${ch} = ${channels[ch].toFixed(0)}, expected < 200`;
+            errors.push(msg);
+            console.error(`${tag} ${msg}`);
+          }
+        }
+        // Weakest "on" > 1.3× strongest "off"
+        if (onCh.length > 0 && offCh.length > 0) {
+          const weakestOn = Math.min(...onCh.map(ch => channels[ch]));
+          const strongestOff = Math.max(...offCh.map(ch => channels[ch]));
+          if (strongestOff > 0 && weakestOn / strongestOff < 1.3) {
+            const msg = `[E2E SMPTE] ${name} bar: hue separation too low — weakest on=${weakestOn.toFixed(0)}, strongest off=${strongestOff.toFixed(0)}, ratio=${(weakestOn / strongestOff).toFixed(2)}`;
+            errors.push(msg);
+            console.error(`${tag} ${msg}`);
+          }
+        }
+        console.log(`${tag}   ${name}: R=${channels[0].toFixed(0)} G=${channels[1].toFixed(0)} B=${channels[2].toFixed(0)}`);
+      }
+    }
+
+    // E2E: Grayscale monotonicity
+    console.log(`\n${tag} E2E: Grayscale monotonicity...`);
+    {
+      let prevLum = -5;
+      let monoOk = true;
+      for (let i = 0; i < 16; i++) {
+        const sx = RAMP_X + i * STEP_W;
+        const color = await sampleRegionColor(page, sx, RAMP_Y, STEP_W, RAMP_H);
+        const lum = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+        if (lum < prevLum - 5) {
+          const msg = `[E2E grayscale] Step ${i}: luminance ${lum.toFixed(1)} < previous ${prevLum.toFixed(1)} (non-monotonic)`;
+          errors.push(msg);
+          console.error(`${tag} ${msg}`);
+          monoOk = false;
+        }
+        prevLum = lum;
+      }
+      if (monoOk) console.log(`${tag}   Grayscale monotonicity OK`);
+    }
+
+    // E2E: Gamma curve (default config, wider tolerance)
+    console.log(`\n${tag} E2E: Gamma curve (default config)...`);
+    {
+      const logInputs = [];
+      const logOutputs = [];
+      for (let i = 2; i <= 13; i++) {
+        const sx = RAMP_X + i * STEP_W;
+        const color = await sampleRegionColor(page, sx, RAMP_Y, STEP_W, RAMP_H);
+        const inputVal = (i / 15) * 255;
+        const outputLum = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+        if (inputVal > 0 && outputLum > 0) {
+          logInputs.push(Math.log(inputVal / 255));
+          logOutputs.push(Math.log(outputLum / 255));
+        }
+      }
+      if (logInputs.length >= 4) {
+        // Linear regression: logOutput = gamma * logInput + offset
+        const n = logInputs.length;
+        const sumX = logInputs.reduce((a, b) => a + b, 0);
+        const sumY = logOutputs.reduce((a, b) => a + b, 0);
+        const sumXY = logInputs.reduce((a, x, i) => a + x * logOutputs[i], 0);
+        const sumX2 = logInputs.reduce((a, x) => a + x * x, 0);
+        const gamma = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+        console.log(`${tag}   Measured effective gamma: ${gamma.toFixed(3)} (expected ≈ 1.09, tolerance ±0.2)`);
+        if (Math.abs(gamma - 1.09) > 0.2) {
+          const msg = `[E2E gamma] Measured gamma ${gamma.toFixed(3)} outside expected range 0.89–1.29`;
+          errors.push(msg);
+          console.error(`${tag} ${msg}`);
+        }
+      } else {
+        console.warn(`${tag}   Not enough data points for gamma regression`);
+      }
+    }
+
+    // --- Unit test: Passthrough (neutral config) ---
+    console.log(`\n${tag} Unit: Passthrough (neutral config)...`);
+    {
+      await applyConfigAndRender(page, NEUTRAL_CRT);
+      // Sample white bar (first SMPTE bar)
+      const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
+      console.log(`${tag}   White bar: R=${color.r.toFixed(0)} G=${color.g.toFixed(0)} B=${color.b.toFixed(0)} (expected ≈ 255 ±15)`);
+      const avg = (color.r + color.g + color.b) / 3;
+      if (Math.abs(avg - 255) > 15) {
+        const msg = `[Unit passthrough] White bar average ${avg.toFixed(0)}, expected ≈ 255 (±15)`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // --- Unit test: CRT gamma (BT.1886) ---
+    console.log(`\n${tag} Unit: CRT gamma (crtGamma=2.4)...`);
+    {
+      await applyConfigAndRender(page, { ...NEUTRAL_CRT, crtGamma: 2.4 });
+      const logInputs = [];
+      const logOutputs = [];
+      for (let i = 2; i <= 13; i++) {
+        const sx = RAMP_X + i * STEP_W;
+        const color = await sampleRegionColor(page, sx, RAMP_Y, STEP_W, RAMP_H);
+        const inputVal = (i / 15) * 255;
+        const outputLum = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+        if (inputVal > 0 && outputLum > 0) {
+          logInputs.push(Math.log(inputVal / 255));
+          logOutputs.push(Math.log(outputLum / 255));
+        }
+      }
+      if (logInputs.length >= 4) {
+        const n = logInputs.length;
+        const sumX = logInputs.reduce((a, b) => a + b, 0);
+        const sumY = logOutputs.reduce((a, b) => a + b, 0);
+        const sumXY = logInputs.reduce((a, x, i) => a + x * logOutputs[i], 0);
+        const sumX2 = logInputs.reduce((a, x) => a + x * x, 0);
+        const gamma = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+        console.log(`${tag}   Measured gamma: ${gamma.toFixed(3)} (expected ≈ 1.09, tolerance ±0.15)`);
+        if (Math.abs(gamma - 1.09) > 0.15) {
+          const msg = `[Unit gamma] Measured gamma ${gamma.toFixed(3)} outside expected range 0.94–1.24`;
+          errors.push(msg);
+          console.error(`${tag} ${msg}`);
+        }
+      } else {
+        const msg = `[Unit gamma] Not enough data points for gamma regression`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // --- Unit test: Scanline darkening ---
+    console.log(`\n${tag} Unit: Scanline darkening...`);
+    {
+      await applyConfigAndRender(page, { ...NEUTRAL_CRT, retraceLines: true, scanlineIntensity: 0.6 });
+      // Sample white bar (large area averages over scanlines)
+      const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
+      const avg = (color.r + color.g + color.b) / 3;
+      // Average scanline mask = 0.7 in linear space.
+      // With gamma 2.2/2.2: encode(0.7) = pow(0.7, 1/2.2) ≈ 0.85 → 217.
+      // Jensen's inequality (concave pow) lowers the pixel average to ~210.
+      console.log(`${tag}   White bar avg: ${avg.toFixed(0)} (expected ≈ 210 ±30)`);
+      if (Math.abs(avg - 210) > 30) {
+        const msg = `[Unit scanlines] White bar average ${avg.toFixed(0)}, expected ≈ 210 (±30)`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // --- Unit test: Brightness ---
+    console.log(`\n${tag} Unit: Brightness (0.5)...`);
+    {
+      await applyConfigAndRender(page, { ...NEUTRAL_CRT, brightness: 0.5 });
+      const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
+      const avg = (color.r + color.g + color.b) / 3;
+      console.log(`${tag}   White bar avg: ${avg.toFixed(0)} (expected ≈ 128 ±15)`);
+      if (Math.abs(avg - 128) > 15) {
+        const msg = `[Unit brightness] White bar average ${avg.toFixed(0)}, expected ≈ 128 (±15)`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // --- Unit test: Contrast ---
+    console.log(`\n${tag} Unit: Contrast (2.0)...`);
+    {
+      await applyConfigAndRender(page, { ...NEUTRAL_CRT, contrast: 2.0 });
+      // Sample 75% gray step (step index 11, input ≈ 187)
+      const sx = RAMP_X + 11 * STEP_W;
+      const color = await sampleRegionColor(page, sx, RAMP_Y, STEP_W, RAMP_H);
+      const avg = (color.r + color.g + color.b) / 3;
+      // Expected: ((187/255 - 0.5) * 2.0 + 0.5) * 255 ≈ 228
+      const expected = ((((11 / 15) * 255) / 255 - 0.5) * 2.0 + 0.5) * 255;
+      console.log(`${tag}   75%% gray avg: ${avg.toFixed(0)} (expected ≈ ${expected.toFixed(0)} ±20)`);
+      if (Math.abs(avg - expected) > 20) {
+        const msg = `[Unit contrast] 75% gray average ${avg.toFixed(0)}, expected ≈ ${expected.toFixed(0)} (±20)`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // --- Unit test: Desaturation ---
+    console.log(`\n${tag} Unit: Desaturation (0.5)...`);
+    {
+      await applyConfigAndRender(page, { ...NEUTRAL_CRT, desaturation: 0.5 });
+      // Sample red bar (6th color patch: pure R at patchX + 0*patchWidth)
+      // Actually the 5th SMPTE bar is red (index 5): bars[5] = [255, 0, 0]
+      const redBarX = BARS_X + 5 * BAR_W;
+      const color = await sampleRegionColor(page, redBarX, BARS_Y, BAR_W, BARS_H);
+      // lum = 0.299*255 = 76.2; R = mix(255, 76.2, 0.5) = 165.6; G = mix(0, 76.2, 0.5) = 38.1
+      console.log(`${tag}   Red bar: R=${color.r.toFixed(0)} G=${color.g.toFixed(0)} B=${color.b.toFixed(0)} (expected ≈ 166, 38, 38 ±20)`);
+      if (Math.abs(color.r - 166) > 20 || Math.abs(color.g - 38) > 20 || Math.abs(color.b - 38) > 20) {
+        const msg = `[Unit desaturation] Red bar R=${color.r.toFixed(0)} G=${color.g.toFixed(0)} B=${color.b.toFixed(0)}, expected ≈ (166, 38, 38) ±20`;
+        errors.push(msg);
+        console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // Restore default config and leave demo in clean state
+    console.log(`\n${tag} Restoring default CRT config...`);
+    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+    await page.evaluate(() => {
+      window.maalataRenderer.updateCRTConfig({});
+      window.maalataRenderTestPattern();
+    });
+    /* eslint-enable no-undef */
     await page.waitForTimeout(500);
 
     await page.close();

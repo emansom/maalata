@@ -32,6 +32,7 @@ async function initializeDemo() {
     { label: 'Draw Static',     x: 20, y: 60,  width: 150, height: 40, action: () => { stopAnimation(); renderStaticUI(); } },
     { label: 'Start Animation', x: 20, y: 120, width: 150, height: 40, action: startAnimation },
     { label: 'Stop Animation',  x: 20, y: 180, width: 150, height: 40, action: stopAnimation },
+    { label: 'Test Pattern',    x: 20, y: 240, width: 150, height: 40, action: () => { stopAnimation(); renderTestPattern(); } },
   ];
 
   function drawButtons() {
@@ -42,6 +43,61 @@ async function initializeDemo() {
       ctx.font = '13px monospace';
       ctx.fillText(btn.label, btn.x + 10, btn.y + 26);
     }
+  }
+
+  function renderTestPattern() {
+    const { width, height } = renderer.getCanvasSize();
+    ctx.fillStyle = '#1a1a2a';
+    ctx.fillRect(0, 0, width, height);
+
+    // Title
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('Maalata Demo', 20, 35);
+
+    // SMPTE color bars: white, yellow, cyan, green, magenta, red, blue
+    const bars = [
+      [255, 255, 255], [255, 255, 0], [0, 255, 255], [0, 255, 0],
+      [255, 0, 255], [255, 0, 0], [0, 0, 255],
+    ];
+    const barsX = 200, barsY = 20, barsW = 580, barsH = 200;
+    const barWidth = barsW / bars.length;
+    for (let i = 0; i < bars.length; i++) {
+      const [r, g, b] = bars[i];
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(barsX + i * barWidth, barsY, barWidth, barsH);
+    }
+
+    // Grayscale ramp: 16 steps from black to white
+    const rampX = 200, rampY = 240, rampW = 580, rampH = 60;
+    const stepWidth = rampW / 16;
+    for (let i = 0; i < 16; i++) {
+      const v = Math.round((i / 15) * 255);
+      ctx.fillStyle = `rgb(${v},${v},${v})`;
+      ctx.fillRect(rampX + i * stepWidth, rampY, stepWidth, rampH);
+    }
+
+    // Color patches: pure R, G, B, orange, violet, sky blue
+    const patches = [
+      [255, 0, 0], [0, 255, 0], [0, 0, 255],
+      [255, 165, 0], [148, 0, 211], [135, 206, 235],
+    ];
+    const patchX = 200, patchY = 320, patchW = 580, patchH = 60;
+    const patchWidth = patchW / patches.length;
+    for (let i = 0; i < patches.length; i++) {
+      const [r, g, b] = patches[i];
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(patchX + i * patchWidth, patchY, patchWidth, patchH);
+    }
+
+    // Labels
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '11px monospace';
+    ctx.fillText('SMPTE Color Bars', barsX, barsY - 4);
+    ctx.fillText('Grayscale Ramp (16 steps)', rampX, rampY - 4);
+    ctx.fillText('Color Patches', patchX, patchY - 4);
+
+    drawButtons();
   }
 
   function renderStaticUI() {
@@ -157,6 +213,12 @@ async function initializeDemo() {
       startAnimation();
     }
   });
+
+  // Expose for verify-demo per-step testing
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const w = window as any;
+  w.maalataRenderer = renderer;
+  w.maalataRenderTestPattern = renderTestPattern;
 
   await renderer.ready();
   renderStaticUI();
