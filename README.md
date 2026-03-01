@@ -152,4 +152,4 @@ The combined fragment shader draws from three MIT-licensed implementations:
 
 ## License
 
-[MIT](LICENSE)
+[AGPL-3.0-only](LICENSE)
