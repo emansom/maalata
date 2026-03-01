@@ -80,12 +80,15 @@ export class CanvasRenderer {
     // Get the shared CanvasAPI from the renderer
     this._canvasAPI = this._renderer.getCanvasAPI();
 
-    // Resolve and apply background color (opaque canvas clear color)
-    const [bgR, bgG, bgB] = this._resolveBackgroundColor(this._canvas, config.backgroundColor);
-    this._renderer.setBackgroundColor(bgR, bgG, bgB);
+    // Apply explicit background color override, or use canvas-ultrafast's auto-detected value
+    if (config.backgroundColor) {
+      const c = parseColor(config.backgroundColor);
+      this._renderer.setBackgroundColor(c[0], c[1], c[2]);
+    }
 
     // Set up CRT or passthrough display
     if (this._crtEnabled) {
+      const [bgR, bgG, bgB] = this._renderer.getBackgroundColor();
       this._crtDisplay = new CRTDisplay(
         this._renderer.getGL(),
         this._canvas,
@@ -154,9 +157,9 @@ export class CanvasRenderer {
 
   /** Set the background color at runtime (e.g. for theme switching). */
   public setBackgroundColor(color: string): void {
-    const [r, g, b] = this._resolveBackgroundColor(this._canvas, color);
-    this._renderer.setBackgroundColor(r, g, b);
-    if (this._crtDisplay) this._crtDisplay.setBgColor(r, g, b);
+    const c = parseColor(color);
+    this._renderer.setBackgroundColor(c[0], c[1], c[2]);
+    if (this._crtDisplay) this._crtDisplay.setBgColor(c[0], c[1], c[2]);
   }
 
   public screenshot(): Promise<ImageBitmap> {
@@ -280,35 +283,6 @@ export class CanvasRenderer {
       this._dispatchEvent({ type: 'ready' });
       this._dispatchEvent({ type: 'canvas-replaced', canvas: this.getCanvas() });
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // Private: background color resolution
-  // -------------------------------------------------------------------------
-
-  private _resolveBackgroundColor(
-    canvas: HTMLCanvasElement,
-    explicit?: string,
-  ): [number, number, number] {
-    if (explicit) {
-      const c = parseColor(explicit);
-      return [c[0], c[1], c[2]];
-    }
-
-    // Walk up the DOM to find a non-transparent background color
-    let el: HTMLElement | null = canvas.parentElement;
-    while (el) {
-      const bg = getComputedStyle(el).backgroundColor;
-      if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
-        const c = parseColor(bg);
-        // Only use if not fully transparent
-        if (c[3] > 0) return [c[0], c[1], c[2]];
-      }
-      el = el.parentElement;
-    }
-
-    // Fallback: white (browser default page background)
-    return [1, 1, 1];
   }
 
   // -------------------------------------------------------------------------
