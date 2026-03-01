@@ -1,6 +1,6 @@
 {
   "name": "maalata",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "2002 era retro canvas experience — latency pipeline + CRT post-processing over canvas-ultrafast",
   "type": "module",
   "main": "dist/maalata.umd.js",
