@@ -1,0 +1,23 @@
+{
+  "name": "demo-maalata",
+  "version": "1.0.0",
+  "description": "Maalata demo — CRT post-processing + latency pipeline",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "lint": "eslint .",
+    "type-check": "tsc --noEmit && npm run lint",
+    "build": "npm run type-check && NODE_ENV=production vite build --mode production",
+    "build:dev": "npm run type-check && NODE_ENV=development vite build --mode development",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "maalata": "file:.."
+  },
+  "devDependencies": {
+    "@minify-html/node": "^0.18.1",
+    "eslint": "^10.0.1",
+    "typescript": "~5.8.2",
+    "vite": "^7.3.1"
+  }
+}
