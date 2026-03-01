@@ -93,6 +93,7 @@ interface _CRTUniforms {
   _bfiGainVsBlur: WebGLUniformLocation | null;
   _crtGamma: WebGLUniformLocation | null;
   _displayGamma: WebGLUniformLocation | null;
+  _bgColor: WebGLUniformLocation | null;
 }
 
 export class CRTDisplay {
@@ -239,6 +240,13 @@ export class CRTDisplay {
     this._setCRTConfig(config);
   }
 
+  /** Set the background color uniform for OOB pixels in the CRT shader. */
+  setBgColor(r: number, g: number, b: number): void {
+    const gl = this._gl;
+    gl.useProgram(this._program);
+    gl.uniform3f(this._uniforms._bgColor, r, g, b);
+  }
+
   /** Clean up resources. */
   destroy(): void {
     this.stop();
@@ -295,6 +303,7 @@ export class CRTDisplay {
       _bfiGainVsBlur:     gl.getUniformLocation(program, 'u_bfiGainVsBlur'),
       _crtGamma:          gl.getUniformLocation(program, 'u_crtGamma'),
       _displayGamma:      gl.getUniformLocation(program, 'u_displayGamma'),
+      _bgColor:           gl.getUniformLocation(program, 'u_bgColor'),
     };
   }
 

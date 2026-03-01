@@ -1,6 +1,6 @@
 {
   "name": "maalata",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "2002 era retro canvas experience — latency pipeline + CRT post-processing over canvas-ultrafast",
   "type": "module",
   "main": "dist/maalata.umd.js",
@@ -38,7 +38,7 @@
   ],
   "license": "AGPL-3.0-only",
   "dependencies": {
-    "canvas-ultrafast": "*"
+    "canvas-ultrafast": "^1.0.3"
   },
   "files": [
     "dist"

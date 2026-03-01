@@ -9,7 +9,7 @@
  * Public API is backward compatible with the monolithic library.
  */
 
-import { UltrafastRenderer, CanvasAPI, type CanvasCommand } from 'canvas-ultrafast';
+import { UltrafastRenderer, CanvasAPI, parseColor, type CanvasCommand } from 'canvas-ultrafast';
 import { CRTDisplay, type CRTConfig } from './crt-display';
 import { USBPolling, OSKernelProcessing, ApplicationFrame, LCDPanel } from './pipeline';
 
@@ -22,6 +22,8 @@ export interface RendererConfig {
   crt?: boolean;
   /** CRT filter parameters. Only used when crt is enabled. */
   crtConfig?: Partial<CRTConfig>;
+  /** Explicit background color (CSS string). If omitted, auto-detected from DOM. */
+  backgroundColor?: string;
 }
 
 export type RendererEvent =
@@ -78,6 +80,10 @@ export class CanvasRenderer {
     // Get the shared CanvasAPI from the renderer
     this._canvasAPI = this._renderer.getCanvasAPI();
 
+    // Resolve and apply background color (opaque canvas clear color)
+    const [bgR, bgG, bgB] = this._resolveBackgroundColor(this._canvas, config.backgroundColor);
+    this._renderer.setBackgroundColor(bgR, bgG, bgB);
+
     // Set up CRT or passthrough display
     if (this._crtEnabled) {
       this._crtDisplay = new CRTDisplay(
@@ -87,6 +93,7 @@ export class CanvasRenderer {
         () => this._hasContent,
         config.crtConfig,
       );
+      this._crtDisplay.setBgColor(bgR, bgG, bgB);
       this._crtDisplay.start();
     } else {
       // No CRT — restart the passthrough display
@@ -143,6 +150,13 @@ export class CanvasRenderer {
 
   public updateCRTConfig(config: Partial<CRTConfig>): void {
     if (this._crtDisplay) this._crtDisplay.updateConfig(config);
+  }
+
+  /** Set the background color at runtime (e.g. for theme switching). */
+  public setBackgroundColor(color: string): void {
+    const [r, g, b] = this._resolveBackgroundColor(this._canvas, color);
+    this._renderer.setBackgroundColor(r, g, b);
+    if (this._crtDisplay) this._crtDisplay.setBgColor(r, g, b);
   }
 
   public screenshot(): Promise<ImageBitmap> {
@@ -266,6 +280,35 @@ export class CanvasRenderer {
       this._dispatchEvent({ type: 'ready' });
       this._dispatchEvent({ type: 'canvas-replaced', canvas: this.getCanvas() });
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: background color resolution
+  // -------------------------------------------------------------------------
+
+  private _resolveBackgroundColor(
+    canvas: HTMLCanvasElement,
+    explicit?: string,
+  ): [number, number, number] {
+    if (explicit) {
+      const c = parseColor(explicit);
+      return [c[0], c[1], c[2]];
+    }
+
+    // Walk up the DOM to find a non-transparent background color
+    let el: HTMLElement | null = canvas.parentElement;
+    while (el) {
+      const bg = getComputedStyle(el).backgroundColor;
+      if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+        const c = parseColor(bg);
+        // Only use if not fully transparent
+        if (c[3] > 0) return [c[0], c[1], c[2]];
+      }
+      el = el.parentElement;
+    }
+
+    // Fallback: white (browser default page background)
+    return [1, 1, 1];
   }
 
   // -------------------------------------------------------------------------

@@ -96,6 +96,7 @@ export const CRT_FRAGMENT_SRC = `
   uniform float u_signalLoss;
   uniform float u_dotMask;
   uniform float u_vignetteStrength;
+  uniform vec3 u_bgColor;
 
   // CRT gamma pipeline: BT.1886 decode + sRGB encode
   uniform float u_crtGamma;      // CRT native gamma (default 2.4, BT.1886)
@@ -185,7 +186,7 @@ export const CRT_FRAGMENT_SRC = `
     // gingerbeardman: OOB early-out after distortion — avoids all further work
     // for pixels that land outside the texture. Returns black immediately.
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      gl_FragColor = vec4(u_bgColor, 1.0);
       return;
     }
 
