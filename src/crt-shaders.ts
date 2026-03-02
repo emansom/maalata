@@ -7,15 +7,14 @@
  *   https://github.com/Ichiaka/CRTFilter
  *   Original basis for the effects pipeline: barrel distortion, chromatic
  *   aberration, static noise, horizontal tearing, glow/bloom, vertical jitter,
- *   signal loss, scanlines, dot mask, desaturation, contrast/brightness, flicker.
+ *   signal loss, desaturation, contrast/brightness, flicker.
  *
  * - gingerbeardman/webgl-crt-shader (MIT)
  *   https://github.com/gingerbeardman/webgl-crt-shader
  *   Performance optimizations adopted: early-out guards for disabled effects,
  *   out-of-bounds check after barrel distortion, vignette function (Chebyshev
  *   distance squared), `highp` precision selection via GL_FRAGMENT_PRECISION_HIGH,
- *   combined lighting mask (scanlines + flicker + vignette in single multiply),
- *   configurable scanline count uniform.
+ *   combined lighting mask (flicker + vignette in single multiply).
  *
  * - Blur Busters CRT Beam Simulator (MIT)
  *   https://github.com/blurbusters/crt-beam-simulator
@@ -30,8 +29,9 @@
  * - Chromatic aberration conditional: 1 texture read when aberration ≈ 0,
  *   3 reads only when active. This is the biggest per-fragment win.
  * - Every effect block guarded by `> 0.0001` threshold check for early-out.
- * - Bool uniforms (u_retrace, u_dotMask) replaced with float intensity values
- *   so they participate in the same early-out pattern.
+ * - Pixel beam (Gaussian CRT phosphor dots) replaced both sin-based scanlines
+ *   and mod-based dot mask — matches real CRT physics where beam cross-section
+ *   creates both pixel shapes and scanline gaps as a single effect.
  * - Vignette from gingerbeardman added as part of the combined lighting mask.
  * - gingerbeardman's 5-tap bloom intentionally NOT adopted (4 extra texture
  *   reads per fragment); current smoothstep glow is much cheaper.
@@ -96,8 +96,8 @@ export const CRT_VERTEX_SRC = `
  *  6. Static noise (linear)
  *  7. Glow/bloom (linear, adjusted threshold)
  *  8. Signal loss (linear)
- *  9. Combined lighting mask: scanlines + flicker + vignette (linear)
- * 10. Dot mask (linear)
+ *  9. Lighting mask: flicker + vignette (linear)
+ * 10. Pixel beam: 2D Gaussian CRT phosphor dot simulation
  * 11. Encode with display gamma (2.2, sRGB)
  * 12. Color: desaturation → contrast → brightness (perceptual)
  */
@@ -123,12 +123,10 @@ export const CRT_FRAGMENT_SRC = `
   uniform float u_contrast;
   uniform float u_desaturation;
   uniform float u_flicker;
-  uniform float u_scanlineIntensity;
-  uniform float u_scanlineCount;
   uniform float u_curvature;
   uniform float u_signalLoss;
-  uniform float u_dotMask;
   uniform float u_vignetteStrength;
+  uniform vec2 u_inputSize;
   uniform vec3 u_bgColor;
 
   // CRT gamma pipeline: BT.1886 decode + sRGB encode
@@ -295,18 +293,11 @@ export const CRT_FRAGMENT_SRC = `
       col *= 1.0 - (u_signalLoss * abs(sin(uv.y * 50.0 + u_time * 10.0)));
     }
 
-    // --- 9. Combined lighting mask (gingerbeardman pattern) ---
-    // Combine scanlines, flicker, and vignette into a single multiplier.
-    // One multiply is cheaper than three separate multiply operations.
+    // --- 9. Combined lighting mask: flicker + vignette (linear) ---
+    // Scanline gaps are now created by the pixel beam's vertical Gaussian
+    // profile (step 10), matching real CRT behavior where scan line gaps
+    // were a natural result of beam cross-section, not a separate effect.
     float mask = 1.0;
-
-    // Scanlines (Ichiaka effect, gingerbeardman's configurable count pattern)
-    // Fixed: original had 1.9 + intensity*sin() which amplified brightness 1.3-2.5x.
-    // That compensated for a double-multiplication bug in CRTFilter that maalata doesn't have.
-    // New formula: dark lines at (1-intensity), bright lines at 1.0, no amplification.
-    if (u_scanlineIntensity > 0.0001) {
-      mask *= 1.0 - u_scanlineIntensity * 0.5 * (1.0 - sin(uv.y * u_scanlineCount + u_time * 10.0));
-    }
 
     // Flicker (Ichiaka)
     if (u_flicker > 0.0001) {
@@ -320,16 +311,37 @@ export const CRT_FRAGMENT_SRC = `
 
     col *= mask;
 
-    // --- 10. Dot mask (Ichiaka, converted from bool to float intensity) ---
-    // Original was a bool uniform; now float so it participates in early-out
-    // pattern and allows variable intensity.
-    if (u_dotMask > 0.0001) {
-      vec3 dotEffect = vec3(
-        1.0,
-        0.9 + 0.1 * mod(uv.x * 100.0, 2.0),
-        0.9 + 0.1 * mod(uv.y * 100.0, 2.0)
-      );
-      col *= mix(vec3(1.0), dotEffect, u_dotMask);
+    // --- 10. Pixel beam (Gaussian CRT phosphor dot simulation) ---
+    // Replaces both the sin-based scanlines and mod-based dot mask with a
+    // unified 2D Gaussian beam model. On a real CRT, the electron beam has
+    // a Gaussian cross-section that creates both the pixel dot shape AND the
+    // scanline gaps — they are the same physical effect.
+    //
+    // Virtual CRT pixel grid: beamScale canvas pixels per CRT dot.
+    // Auto-derived from canvas height: targets ~180 dots vertically above
+    // 540p, minimum 3px/dot below 540p for visible roundness.
+    //
+    // Brightness-dependent beam width (CRT physics): higher beam current
+    // excites a wider phosphor area. Inspired by CRT-Geom (cgwg) beam
+    // profile and CRT-Royale brightness-dependent sigma.
+    //
+    // u_inputSize.y < 1.0 bypasses the beam (used by verify-demo tests
+    // that need a clean signal for gamma/passthrough measurements).
+    if (u_inputSize.y > 0.5) {
+      float beamScale = max(3.0, u_inputSize.y / 180.0);
+
+      // Position in virtual CRT pixel grid
+      vec2 crtCoord = uv * u_inputSize / beamScale;
+      vec2 center = floor(crtCoord) + 0.5;
+      vec2 dist = crtCoord - center;  // [-0.5, 0.5] from CRT pixel center
+
+      // Brightness-dependent beam width
+      // lum=0: σ=0.21 (tight dot), lum=1: σ=0.44 (broad, gaps nearly filled)
+      float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      float sigma = 0.35 * (0.6 + 0.65 * sqrt(lum));
+
+      // 2D Gaussian beam profile → round phosphor dot shape
+      col *= exp(-dot(dist, dist) / (2.0 * sigma * sigma));
     }
 
     // --- 11. Encode with display gamma (sRGB) ---

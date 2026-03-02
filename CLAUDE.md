@@ -49,7 +49,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **`maalata.ts`**: `CanvasRenderer` class. Creates `UltrafastRenderer`, immediately `stopDisplay()`. Builds 4-stage latency pipeline. Manages CRT display and idle shutdown.
 - **`pipeline.ts`**: USB(8ms) → OS(10ms) → App(125ms) → LCD(25ms) latency simulation.
 - **`crt-display.ts`**: `CRTDisplay` class. Owns its own RAF loop, reads ready texture from UltrafastRenderer, applies CRT shader.
-- **`crt-shaders.ts`**: CRT vertex + fragment GLSL (barrel distortion, scanlines, chromatic aberration, etc.).
+- **`crt-shaders.ts`**: CRT vertex + fragment GLSL (barrel distortion, pixel beam, chromatic aberration, etc.).
 
 ### Key design decisions
 
@@ -58,6 +58,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **CRT as overlay**: `CRTDisplay` takes over the display loop on the same GL context, reading from `getReadyTexture()`.
 - **Idle shutdown**: Stop CRT/passthrough RAF loop. `preserveDrawingBuffer: true` keeps last frame visible. Resume = restart RAF.
 - **esbuild `mangleProps: /^_/`**: All `_`-prefixed properties are renamed in production. Cross-file methods must NOT use `_` prefix. Each package mangles independently.
+- **Pixel beam (Gaussian CRT phosphor dots)**: Step 10 renders each virtual CRT pixel as a 2D Gaussian with brightness-dependent width. Replaces both the sin-based scanlines and mod-based dot mask — on real CRTs, scanline gaps were created by the beam's vertical profile (same physical effect as horizontal dot shaping). Auto-derived from canvas size: `beamScale = max(3.0, height/180)`. No CRTConfig fields; always active.
 - **CRT colorspace (BT.1886 → sRGB)**: Shader decodes with γ=2.4 (BT.1886 CRT phosphor response), processes effects in linear space, encodes with γ=2.2 (sRGB). Net gamma 1.09 = authentic CRT contrast. No color primary conversion needed (PC P22 phosphors ≈ sRGB). WebGL RGBA textures have no hardware sRGB — all gamma is manual via `pow()`. See `crt-shaders.ts` file header for full rationale.
 
 ### Renderer events

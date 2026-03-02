@@ -3,7 +3,7 @@
  *
  * Takes ownership of the display loop on a shared WebGL2 context.
  * Reads from UltrafastRenderer's ready texture and applies CRT shader
- * effects (barrel distortion, scanlines, chromatic aberration, etc.)
+ * effects (barrel distortion, pixel beam, chromatic aberration, etc.)
  * before blitting to the default framebuffer.
  *
  * Shader lineage:
@@ -11,10 +11,6 @@
  * - gingerbeardman/webgl-crt-shader (MIT) — performance optimizations + vignette
  *
  * See crt-shaders.ts for detailed attribution and per-effect documentation.
- *
- * Config is backward-compatible: existing boolean fields (retraceLines, dotMask)
- * are accepted and converted to float uniforms internally. New fields
- * (vignetteStrength, scanlineCount) default to off / current behavior.
  */
 
 import { CRT_VERTEX_SRC, CRT_FRAGMENT_SRC } from './crt-shaders';
@@ -27,16 +23,12 @@ export interface CRTConfig {
   horizontalTearing: number;
   glowBloom: number;
   verticalJitter: number;
-  retraceLines: boolean;
-  scanlineIntensity: number;
-  dotMask: boolean;
   brightness: number;
   contrast: number;
   desaturation: number;
   flicker: number;
   signalLoss: number;
   vignetteStrength: number;
-  scanlineCount: number;
   bfiStrength: number;
   bfiTargetHz: number;
   bfiGainVsBlur: number;
@@ -52,16 +44,12 @@ const _DEFAULT_CRT_CONFIG: CRTConfig = {
   horizontalTearing: 0.00012,
   glowBloom: 0.001,
   verticalJitter: 0.001,
-  retraceLines: true,
-  scanlineIntensity: 0.6,
-  dotMask: false,
   brightness: 1.0,
   contrast: 1.0,
   desaturation: 0.2,
   flicker: 0.01,
   signalLoss: 0.05,
   vignetteStrength: 0,
-  scanlineCount: 800,
   bfiStrength: 0,
   bfiTargetHz: 60,
   bfiGainVsBlur: 0.7,
@@ -80,13 +68,10 @@ interface _CRTUniforms {
   _tearing: WebGLUniformLocation | null;
   _glow: WebGLUniformLocation | null;
   _jitter: WebGLUniformLocation | null;
-  _dotMask: WebGLUniformLocation | null;
   _brightness: WebGLUniformLocation | null;
   _contrast: WebGLUniformLocation | null;
   _desaturation: WebGLUniformLocation | null;
   _flicker: WebGLUniformLocation | null;
-  _scanlineIntensity: WebGLUniformLocation | null;
-  _scanlineCount: WebGLUniformLocation | null;
   _curvature: WebGLUniformLocation | null;
   _signalLoss: WebGLUniformLocation | null;
   _vignetteStrength: WebGLUniformLocation | null;
@@ -97,6 +82,7 @@ interface _CRTUniforms {
   _crtGamma: WebGLUniformLocation | null;
   _displayGamma: WebGLUniformLocation | null;
   _bgColor: WebGLUniformLocation | null;
+  _inputSize: WebGLUniformLocation | null;
 }
 
 export class CRTDisplay {
@@ -109,6 +95,9 @@ export class CRTDisplay {
   private _rafId: number | null = null;
   private _getReadyTexture: () => WebGLTexture;
   private _hasContent: () => boolean;
+
+  // Pixel beam test bypass
+  private _inputSizeOverride: [number, number] | null = null;
 
   // BFI state
   private _frameCount = 0;
@@ -197,6 +186,13 @@ export class CRTDisplay {
     // Use CRT program
     gl.useProgram(this._program);
     gl.uniform1f(u._time, performance.now() / 1000.0);
+
+    // Pixel beam input size (canvas dimensions or test override)
+    if (this._inputSizeOverride) {
+      gl.uniform2f(u._inputSize!, this._inputSizeOverride[0], this._inputSizeOverride[1]);
+    } else {
+      gl.uniform2f(u._inputSize!, this._canvas.width, this._canvas.height);
+    }
 
     // BFI uniforms
     if (this._bfiActive && this._historyInitialized) {
@@ -290,13 +286,10 @@ export class CRTDisplay {
       _tearing:           gl.getUniformLocation(program, 'u_tearing'),
       _glow:              gl.getUniformLocation(program, 'u_glow'),
       _jitter:            gl.getUniformLocation(program, 'u_jitter'),
-      _dotMask:           gl.getUniformLocation(program, 'u_dotMask'),
       _brightness:        gl.getUniformLocation(program, 'u_brightness'),
       _contrast:          gl.getUniformLocation(program, 'u_contrast'),
       _desaturation:      gl.getUniformLocation(program, 'u_desaturation'),
       _flicker:           gl.getUniformLocation(program, 'u_flicker'),
-      _scanlineIntensity: gl.getUniformLocation(program, 'u_scanlineIntensity'),
-      _scanlineCount:     gl.getUniformLocation(program, 'u_scanlineCount'),
       _curvature:         gl.getUniformLocation(program, 'u_curvature'),
       _signalLoss:        gl.getUniformLocation(program, 'u_signalLoss'),
       _vignetteStrength:  gl.getUniformLocation(program, 'u_vignetteStrength'),
@@ -307,6 +300,7 @@ export class CRTDisplay {
       _crtGamma:          gl.getUniformLocation(program, 'u_crtGamma'),
       _displayGamma:      gl.getUniformLocation(program, 'u_displayGamma'),
       _bgColor:           gl.getUniformLocation(program, 'u_bgColor'),
+      _inputSize:         gl.getUniformLocation(program, 'u_inputSize'),
     };
   }
 
@@ -328,18 +322,15 @@ export class CRTDisplay {
     gl.uniform1f(u._flicker!, c.flicker);
     gl.uniform1f(u._curvature!, c.curvature);
     gl.uniform1f(u._signalLoss!, c.signalLoss);
-    gl.uniform1f(u._scanlineCount!, c.scanlineCount);
     gl.uniform1f(u._vignetteStrength!, c.vignetteStrength);
     gl.uniform1f(u._crtGamma!, c.crtGamma);
     gl.uniform1f(u._displayGamma!, c.displayGamma);
 
-    // Backward compatibility: boolean retraceLines controls scanlineIntensity
-    // When retraceLines is false, zero out scanline intensity to disable the effect
-    gl.uniform1f(u._scanlineIntensity!, c.retraceLines ? c.scanlineIntensity : 0.0);
-
-    // Backward compatibility: boolean dotMask converted to float intensity
-    // true → 1.0 (full effect), false → 0.0 (disabled via early-out in shader)
-    gl.uniform1f(u._dotMask!, c.dotMask ? 1.0 : 0.0);
+    // Pixel beam: auto-calculated from canvas size, no config needed.
+    // _inputSize override for test bypass (set to [0,0] to disable beam).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this._inputSizeOverride = config ? (config as Record<string, any>)._inputSize ?? null : null;
+    gl.uniform2f(u._inputSize!, this._canvas.width, this._canvas.height);
 
     const texLoc = gl.getUniformLocation(this._program, 'u_texture');
     gl.uniform1i(texLoc, 0);

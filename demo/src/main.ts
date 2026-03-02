@@ -14,7 +14,6 @@ async function initializeDemo() {
     canvas: pageCanvas,
     crt: true,
     crtConfig: {
-      scanlineIntensity: 0.6,
       chromaticAberration: 0.0005,
       flicker: 0.020,
     },

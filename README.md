@@ -59,12 +59,14 @@ A single combined GLSL fragment shader applies 12 effect stages in an optimized 
 6. **Static noise** — time-seeded hash for animated grain
 7. **Glow/bloom** — smoothstep-based (no extra texture reads)
 8. **Signal loss** — scanline-frequency intensity modulation
-9. **Lighting mask** — scanlines + flicker + vignette in a single multiply
-10. **Dot mask** — RGB sub-pixel pattern (float intensity)
+9. **Lighting mask** — flicker + vignette in a single multiply
+10. **Pixel beam** — 2D Gaussian CRT phosphor dot simulation (brightness-dependent width)
 11. **sRGB gamma encode** — re-encode with γ=2.2 for display
 12. **Color** — desaturation, contrast, brightness (perceptual space)
 
 Every effect block is guarded by a `> 0.0001` threshold check for early-out when disabled. The shader was combined from three MIT-licensed sources — see [Inspiration & prior art](#inspiration--prior-art) for full attribution.
+
+**Pixel beam** — Each virtual CRT pixel is rendered as a 2D Gaussian phosphor dot with brightness-dependent width, simulating the electron beam's cross-section as it excites phosphors. Brighter pixels have wider beams (higher current spreads the electron beam), creating natural per-pixel bloom. The beam's vertical Gaussian profile creates scanline-like gaps between rows — on real CRTs this was the same physical effect as the horizontal dot shaping, not a separate phenomenon. The virtual CRT pixel grid is auto-derived from canvas dimensions, targeting ~3+ canvas pixels per CRT dot for visible roundness across 144p–720p. Inspired by CRT-Geom (cgwg) beam profile and CRT-Royale brightness-dependent sigma.
 
 **Colorspace pipeline** — The shader simulates a 2002-era PC CRT monitor on a modern sRGB display. Input is sRGB-encoded (from Canvas 2D API via WebGL RGBA textures — no hardware sRGB conversion). The shader decodes with CRT gamma (γ=2.4, BT.1886 standard for CRT phosphor response), processes physical effects in linear space, then re-encodes with sRGB gamma (γ=2.2). The net gamma of 2.4/2.2 ≈ 1.09 produces the subtle contrast boost characteristic of CRT viewing — midtones render slightly darker, matching what users experienced on real CRT monitors in 2002. No color primary conversion is needed: PC CRT P22 phosphors had primaries nearly identical to sRGB/Rec.709 (unlike TV NTSC/PAL standards which require matrix conversion).
 
@@ -79,7 +81,6 @@ const renderer = new CanvasRenderer({
   canvas: document.getElementById('canvas') as HTMLCanvasElement,
   crt: true,
   crtConfig: {
-    scanlineIntensity: 0.6,
     chromaticAberration: 0.0005,
     flicker: 0.02,
   },
@@ -109,7 +110,7 @@ renderer.destroy();
 |---|---|
 | `CanvasRenderer` | Latency pipeline + CRT display + idle lifecycle |
 | `CanvasAPI` | Canvas 2D-compatible command recording (re-exported from canvas-ultrafast) |
-| `CRTConfig` | All CRT shader parameters (barrel, scanlines, BFI, etc.) |
+| `CRTConfig` | All CRT shader parameters (barrel, pixel beam, BFI, etc.) |
 | `RendererConfig` | Constructor options (canvas, crt toggle, CRT config) |
 | `RendererEvent` | Union type for lifecycle events |
 
