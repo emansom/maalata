@@ -32,11 +32,18 @@ This script:
 1. Builds maalata and the demo in **development mode** (sourcemaps, no minification/mangling)
 2. Starts a static server for the demo on :4173
 3. Launches headless Chromium via Playwright
-4. Navigates, clicks all buttons, samples 10 animation frames, profiles CPU
+4. Navigates, clicks all buttons, samples 10 animation frames
 5. Collects JS exceptions, console.error/warning, failed network requests, visual issues
 6. Exits 0 if clean, 1 if any errors were found
 
 Fix all reported errors, then re-run until the exit code is 0 before considering any change complete.
+
+## Documentation
+
+**Always update documentation** when modifying source files:
+- **Source code**: Update file headers, JSDoc comments, and inline documentation
+- **README.md**: Update relevant sections (architecture, API, algorithm descriptions)
+- **CLAUDE.md**: Update architecture descriptions, design decisions, and file listings
 
 ## Architecture
 
@@ -48,8 +55,9 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 
 - **`maalata.ts`**: `CanvasRenderer` class. Creates `UltrafastRenderer`, immediately `stopDisplay()`. Builds 4-stage latency pipeline. Manages CRT display and idle shutdown.
 - **`pipeline.ts`**: USB(8ms) → OS(10ms) → App(125ms) → LCD(25ms) latency simulation.
-- **`crt-display.ts`**: `CRTDisplay` class. Owns its own RAF loop, reads ready texture from UltrafastRenderer, applies two-pass rendering: Kopf-Lischinski smoothing → CRT shader.
-- **`smooth-shaders.ts`**: Kopf-Lischinski pixel art smoothing fragment GLSL (block detection, YUV similarity, diagonal resolution, edge-aware interpolation).
+- **`crt-display.ts`**: `CRTDisplay` class. Owns its own RAF loop, reads ready texture from UltrafastRenderer, applies four-pass rendering: 4x nearest-neighbor upscale → Kopf-Lischinski smoothing → RGSS 4x downsample → CRT shader.
+- **`smooth-shaders.ts`**: Kopf-Lischinski pixel art smoothing fragment GLSL (block detection, YUV similarity, diagonal resolution, edge-aware interpolation). Operates on 4x upscaled texture.
+- **`downsample-shaders.ts`**: RGSS 4x downsample fragment GLSL. 4 rotated grid samples per output pixel for anti-aliased reduction from 4x to native resolution.
 - **`crt-shaders.ts`**: CRT vertex + fragment GLSL (barrel distortion, pixel beam, chromatic aberration, etc.).
 
 ### Key design decisions
@@ -61,7 +69,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **esbuild `mangleProps: /^_/`**: All `_`-prefixed properties are renamed in production. Cross-file methods must NOT use `_` prefix. Each package mangles independently.
 - **Pixel beam (Gaussian CRT phosphor dots)**: Step 10 renders each virtual CRT pixel as a 2D Gaussian with brightness-dependent width. Replaces both the sin-based scanlines and mod-based dot mask — on real CRTs, scanline gaps were created by the beam's vertical profile (same physical effect as horizontal dot shaping). Auto-derived from canvas size: `beamScale = max(3.0, height/180)`. No CRTConfig fields; always active.
 - **CRT colorspace (BT.1886 → sRGB)**: Shader decodes with γ=2.4 (BT.1886 CRT phosphor response), processes effects in linear space, encodes with γ=2.2 (sRGB). Net gamma 1.09 = authentic CRT contrast. No color primary conversion needed (PC P22 phosphors ≈ sRGB). WebGL RGBA textures have no hardware sRGB — all gamma is manual via `pow()`. See `crt-shaders.ts` file header for full rationale.
-- **Pixel art smoothing (Kopf-Lischinski)**: Pre-processing pass in `smooth-shaders.ts`, runs before CRT effects. Adapts Kopf-Lischinski depixelization for per-fragment WebGL2: block detection finds logical pixel scale, YUV similarity graph with perceptual thresholds (Y<=48, U<=7, V<=6), diagonal crossing resolution via valence heuristic, edge-aware interpolation at block boundaries with diagonal cell cuts. Renders to intermediate FBO; CRT shader reads smoothed result. Bypassed when `_inputSize: [0, 0]`. Always active.
+- **Pixel art smoothing (4x Kopf-Lischinski + RGSS)**: Three-pass pre-processing: (1) nearest-neighbor 4x upscale via `blitFramebuffer` (W×H → 2W×2H), (2) Kopf-Lischinski smoothing at 4x resolution in `smooth-shaders.ts` — block detection, YUV similarity graph (Y<=48, U<=7, V<=6), diagonal crossing resolution via valence heuristic, edge-aware interpolation with smoothstep(0.3, 1.0) tuned for 4x blocks, (3) RGSS 4x downsample in `downsample-shaders.ts` — 4 rotated grid samples per output pixel back to native resolution. Same output size, 4× spatial precision for edge interpolation. Bypassed when `_inputSize: [0, 0]`. Always active.
 
 ### Renderer events
 

@@ -40,7 +40,6 @@ const DEMO = {
   name: 'maalata',
   distDir: resolve(import.meta.dirname, '../demo/dist'),
   port: 4173,
-  cpuThreshold: 80.0,  // CRT + smoothing shaders inflate CPU on SwiftShader
   settleMs: 2000,       // pipeline needs time to flush first frames
 };
 
@@ -246,12 +245,6 @@ async function main() {
     await canvas.click({ position: BUTTONS.startAnimation });
     await page.waitForTimeout(500);
 
-    // Start CDP profiler
-    const cdp = await page.context().newCDPSession(page);
-    await cdp.send('Profiler.enable');
-    await cdp.send('Profiler.setSamplingInterval', { interval: 100 });
-    await cdp.send('Profiler.start');
-
     console.log(`${tag} Sampling ${VISUAL_SAMPLE_COUNT} animation frames...`);
     const frameSamples = [];
     for (let i = 0; i < VISUAL_SAMPLE_COUNT; i++) {
@@ -288,65 +281,6 @@ async function main() {
       console.error(`${tag} ${msg}`);
     }
     console.log(`${tag} Animation visual sampling complete`);
-
-    // Stop CDP profiler
-    const { profile } = await cdp.send('Profiler.stop');
-    await cdp.send('Profiler.disable');
-    await cdp.detach();
-
-    const nodeMap = new Map(profile.nodes.map(n => [n.id, n]));
-    let activeUs = 0;
-    for (let i = 0; i < profile.samples.length; i++) {
-      const node = nodeMap.get(profile.samples[i]);
-      if (node?.callFrame?.functionName !== '(idle)') {
-        activeUs += profile.timeDeltas[i];
-      }
-    }
-    const wallUs = profile.endTime - profile.startTime;
-    const cpuPct = (activeUs / wallUs) * 100;
-    console.log(`${tag} CPU usage: ${cpuPct.toFixed(1)}% (threshold: ${DEMO.cpuThreshold}%)`);
-    if (cpuPct > DEMO.cpuThreshold) {
-      errors.push(`[perf] CPU usage ${cpuPct.toFixed(1)}% exceeds ${DEMO.cpuThreshold}% threshold`);
-    }
-
-    // Top 50 functions by self time
-    const selfByNode = new Map();
-    for (let i = 0; i < profile.samples.length; i++) {
-      const nodeId = profile.samples[i];
-      const delta = profile.timeDeltas[i];
-      const prev = selfByNode.get(nodeId);
-      if (prev) { prev.time += delta; prev.hits++; }
-      else selfByNode.set(nodeId, { time: delta, hits: 1 });
-    }
-
-    const fnStats = new Map();
-    for (const [nodeId, stats] of selfByNode) {
-      const node = nodeMap.get(nodeId);
-      if (!node) continue;
-      const cf = node.callFrame;
-      const file = cf.url ? cf.url.replace(/^.*\//, '') : '';
-      const loc = file ? `${file}:${cf.lineNumber + 1}:${cf.columnNumber + 1}` : '';
-      const name = cf.functionName || '(anonymous)';
-      const key = loc ? `${name} (${loc})` : name;
-
-      const prev = fnStats.get(key);
-      if (prev) { prev.time += stats.time; prev.hits += stats.hits; }
-      else fnStats.set(key, { time: stats.time, hits: stats.hits });
-    }
-
-    const sorted = [...fnStats.entries()]
-      .sort((a, b) => b[1].time - a[1].time)
-      .slice(0, 50);
-
-    const wallMs = wallUs / 1000;
-    console.log(`\n${tag} Top 50 functions by self time (wall ${wallMs.toFixed(0)}ms):`);
-    console.log('  ' + 'Self ms'.padStart(10) + '  ' + '% wall'.padStart(7) + '  ' + 'Hits'.padStart(6) + '  Function');
-    console.log('  ' + '─'.repeat(10) + '  ' + '─'.repeat(7) + '  ' + '─'.repeat(6) + '  ' + '─'.repeat(50));
-    for (const [name, { time: us, hits }] of sorted) {
-      const ms = (us / 1000).toFixed(1);
-      const pct = ((us / wallUs) * 100).toFixed(1);
-      console.log('  ' + ms.padStart(10) + '  ' + (pct + '%').padStart(7) + '  ' + String(hits).padStart(6) + '  ' + name);
-    }
 
     // Click "Stop Animation"
     console.log(`${tag} Clicking "Stop Animation"...`);

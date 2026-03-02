@@ -1,12 +1,14 @@
 /**
  * Pixel Art Smoothing GLSL Shader (Kopf-Lischinski)
  *
- * Pre-processing pass that smooths pre-upscaled pixel art (2x-8x) before
- * CRT effects are applied. Adapts the Kopf-Lischinski depixelization
- * algorithm for real-time per-fragment WebGL2 rendering.
+ * Pre-processing pass that smooths pixel art before CRT effects are applied.
+ * Operates on a 4x nearest-neighbor upscaled texture (2x per dimension) where
+ * each original source pixel is a 2×2 block. This 4x context gives the
+ * interpolation 4× the spatial precision of running at native resolution.
  *
- * Data flow: DOM canvas -> canvas-ultrafast -> maalata pipeline ->
- *            [this shader] -> CRT shader -> display
+ * Data flow:
+ *   Ready texture (W×H) → 4x nearest-neighbor upscale (2W×2H) →
+ *   [this shader at 2W×2H] → RGSS 4x downsample (W×H) → CRT shader
  *
  * The full Kopf-Lischinski pipeline (graph -> polygons -> splines -> SVG)
  * requires sequential processing for polygon extraction. This shader
@@ -17,7 +19,9 @@
  *
  * Algorithm stages per fragment:
  *  1. Block detection — search for uniform-color boundaries (up to 8 texels
- *     per direction) to find the logical pixel this canvas texel belongs to
+ *     per direction) to find the logical pixel this canvas texel belongs to.
+ *     After 4x upscale, original 1-pixel sprites become 2×2 blocks, original
+ *     2×2 become 4×4, etc.
  *  2. 3x3 logical neighborhood — sample 8 adjacent logical pixels by jumping
  *     one texel beyond each detected block boundary
  *  3. YUV similarity graph — compare all neighbor pairs using perceptually-
@@ -27,6 +31,11 @@
  *  5. Edge-aware interpolation — at block boundaries blend toward connected
  *     neighbors; at corners with resolved diagonals apply diagonal cell
  *     boundary cut via signed distance function
+ *
+ * Smoothstep threshold (0.3, 1.0): tuned for the 4x operating context.
+ * After upscale, 2×2 blocks have edgeX max = 0.5 (both texels at edge).
+ * The 0.3 start produces gentle blending (bx≈0.21) for 2×2 blocks, strong
+ * blending (bx≈0.65) for 4×4, and near-full (bx≈0.88) for 8×8.
  *
  * Early-outs:
  *  - u_inputSize.y < 0.5: bypass (test mode, same as CRT beam bypass)
@@ -215,9 +224,10 @@ export const SMOOTH_FRAGMENT_SRC = `
     float edgeX = abs(subX) * 2.0;  // 0 at center, 1 at edge
     float edgeY = abs(subY) * 2.0;
 
-    // Smooth blend ramps near edges (start blending at 60% from center)
-    float bx = smoothstep(0.6, 1.0, edgeX);
-    float by = smoothstep(0.6, 1.0, edgeY);
+    // Smooth blend ramps near edges (start blending at 30% from center)
+    // Tuned for 4x upscale: 2×2 blocks (edgeX=0.5) get bx≈0.21
+    float bx = smoothstep(0.3, 1.0, edgeX);
+    float by = smoothstep(0.3, 1.0, edgeY);
 
     vec3 result = center;
 

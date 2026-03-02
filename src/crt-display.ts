@@ -2,9 +2,20 @@
  * CRT Display — Post-processing overlay for the "2002 era" experience.
  *
  * Takes ownership of the display loop on a shared WebGL2 context.
- * Reads from UltrafastRenderer's ready texture and applies CRT shader
- * effects (barrel distortion, pixel beam, chromatic aberration, etc.)
- * before blitting to the default framebuffer.
+ * Reads from UltrafastRenderer's ready texture and applies four-pass
+ * rendering before blitting to the default framebuffer:
+ *
+ *   Pass 1: Nearest-neighbor 4x upscale (W×H → 2W×2H) via blitFramebuffer
+ *   Pass 2: Kopf-Lischinski smoothing at 4x resolution (2W×2H → 2W×2H)
+ *   Pass 3: RGSS 4x downsample back to native (2W×2H → W×H)
+ *   Pass 4: CRT shader → screen (W×H, 12-step effects pipeline)
+ *
+ * The 4x upscale gives Kopf-Lischinski 4× the spatial precision for edge
+ * interpolation. RGSS (Rotated Grid SuperSampling) downsamples back to
+ * native resolution with high-quality anti-aliasing. Same output resolution
+ * as input, vastly better edge quality.
+ *
+ * Bypass: _inputSize: [0, 0] skips passes 1-3 — CRT reads raw ready texture.
  *
  * Shader lineage:
  * - Ichiaka/CRTFilter (MIT) — original effects pipeline
@@ -15,6 +26,7 @@
 
 import { CRT_VERTEX_SRC, CRT_FRAGMENT_SRC } from './crt-shaders';
 import { SMOOTH_FRAGMENT_SRC } from './smooth-shaders';
+import { DOWNSAMPLE_FRAGMENT_SRC } from './downsample-shaders';
 
 export interface CRTConfig {
   barrelDistortion: number;
@@ -111,15 +123,30 @@ export class CRTDisplay {
   private _bfiGainVsBlur = 0.7;
   private _historyTextures: WebGLTexture[] = [];
   private _historyFbos: WebGLFramebuffer[] = [];
-  private _srcFbo: WebGLFramebuffer | null = null;
   private _historyIndex = 0;
   private _lastCrtCycle = -1;
   private _historyInitialized = false;
 
-  // Kopf-Lischinski smoothing pass
+  // 4x upscale FBO — nearest-neighbor upscaled source (2W × 2H)
+  private _upscaleFbo: WebGLFramebuffer;
+  private _upscaleTexture: WebGLTexture;
+
+  // Source FBO for blitFramebuffer reads
+  private _srcFbo: WebGLFramebuffer;
+
+  // Kopf-Lischinski smoothing pass (operates at 4x resolution)
   private _smoothProgram: WebGLProgram;
   private _smoothInputSizeLoc: WebGLUniformLocation | null;
   private _smoothPositionLoc: number;
+  private _smoothedFbo: WebGLFramebuffer;
+  private _smoothedTexture: WebGLTexture;
+
+  // RGSS downsample pass (4x → native)
+  private _downsampleProgram: WebGLProgram;
+  private _downsampleSourceSizeLoc: WebGLUniformLocation | null;
+  private _downsamplePositionLoc: number;
+
+  // Intermediate FBO — native resolution, stores RGSS output for CRT
   private _intermediateFbo: WebGLFramebuffer;
   private _intermediateTexture: WebGLTexture;
 
@@ -154,7 +181,28 @@ export class CRTDisplay {
 
     this._quadPositionLoc = gl.getAttribLocation(this._program, 'a_position');
 
-    // Create Kopf-Lischinski smoothing program
+    const w = canvas.width;
+    const h = canvas.height;
+    const w4 = w * 2;
+    const h4 = h * 2;
+
+    // Source FBO for blitFramebuffer reads (upscale + BFI capture)
+    this._srcFbo = gl.createFramebuffer()!;
+
+    // 4x Upscale FBO (2W × 2H) — nearest-neighbor upscaled source
+    this._upscaleTexture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaleTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w4, h4, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    this._upscaleFbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaleFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._upscaleTexture, 0);
+
+    // Create Kopf-Lischinski smoothing program (operates at 4x resolution)
     this._smoothProgram = this._createShaderProgram(CRT_VERTEX_SRC, SMOOTH_FRAGMENT_SRC);
     gl.useProgram(this._smoothProgram);
     this._smoothInputSizeLoc = gl.getUniformLocation(this._smoothProgram, 'u_inputSize');
@@ -162,10 +210,31 @@ export class CRTDisplay {
     const smoothTexLoc = gl.getUniformLocation(this._smoothProgram, 'u_texture');
     gl.uniform1i(smoothTexLoc, 0);
 
-    // Intermediate FBO for smoothing output
+    // 4x Smoothed FBO (2W × 2H) — Kopf-Lischinski output
+    this._smoothedTexture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this._smoothedTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w4, h4, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    this._smoothedFbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._smoothedFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smoothedTexture, 0);
+
+    // Create RGSS downsample program
+    this._downsampleProgram = this._createShaderProgram(CRT_VERTEX_SRC, DOWNSAMPLE_FRAGMENT_SRC);
+    gl.useProgram(this._downsampleProgram);
+    this._downsampleSourceSizeLoc = gl.getUniformLocation(this._downsampleProgram, 'u_sourceSize');
+    this._downsamplePositionLoc = gl.getAttribLocation(this._downsampleProgram, 'a_position');
+    const downsampleTexLoc = gl.getUniformLocation(this._downsampleProgram, 'u_texture');
+    gl.uniform1i(downsampleTexLoc, 0);
+
+    // Intermediate FBO (W × H) — stores RGSS downsample output for CRT
     this._intermediateTexture = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this._intermediateTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -184,20 +253,42 @@ export class CRTDisplay {
 
     const gl = this._gl;
     const u = this._uniforms;
+    const w = this._canvas.width;
+    const h = this._canvas.height;
+    const w4 = w * 2;
+    const h4 = h * 2;
     const smoothingActive = !this._inputSizeOverride || this._inputSizeOverride[1] > 0;
 
-    // --- Pass 1: Kopf-Lischinski smoothing ---
     if (smoothingActive) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
-      gl.viewport(0, 0, this._canvas.width, this._canvas.height);
+      // --- Pass 1: Nearest-neighbor 4x upscale via blitFramebuffer ---
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._srcFbo);
+      gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._getReadyTexture(), 0);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this._upscaleFbo);
+      gl.blitFramebuffer(0, 0, w, h, 0, 0, w4, h4, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+
+      // --- Pass 2: Kopf-Lischinski smoothing at 4x resolution ---
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._smoothedFbo);
+      gl.viewport(0, 0, w4, h4);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this._getReadyTexture());
+      gl.bindTexture(gl.TEXTURE_2D, this._upscaleTexture);
       gl.useProgram(this._smoothProgram);
-      gl.uniform2f(this._smoothInputSizeLoc!, this._canvas.width, this._canvas.height);
+      gl.uniform2f(this._smoothInputSizeLoc!, w4, h4);
       gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
       gl.enableVertexAttribArray(this._smoothPositionLoc);
       gl.vertexAttribPointer(this._smoothPositionLoc, 2, gl.FLOAT, false, 0, 0);
       gl.disable(gl.BLEND);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // --- Pass 3: RGSS 4x downsample to native resolution ---
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
+      gl.viewport(0, 0, w, h);
+      gl.bindTexture(gl.TEXTURE_2D, this._smoothedTexture);
+      gl.useProgram(this._downsampleProgram);
+      gl.uniform2f(this._downsampleSourceSizeLoc!, w4, h4);
+      gl.enableVertexAttribArray(this._downsamplePositionLoc);
+      gl.vertexAttribPointer(this._downsamplePositionLoc, 2, gl.FLOAT, false, 0, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       gl.enable(gl.BLEND);
     }
@@ -302,17 +393,21 @@ export class CRTDisplay {
     const gl = this._gl;
     gl.deleteProgram(this._program);
     gl.deleteProgram(this._smoothProgram);
+    gl.deleteProgram(this._downsampleProgram);
     gl.deleteBuffer(this._quadVBO);
+    gl.deleteFramebuffer(this._srcFbo);
+    gl.deleteFramebuffer(this._upscaleFbo);
+    gl.deleteTexture(this._upscaleTexture);
+    gl.deleteFramebuffer(this._smoothedFbo);
+    gl.deleteTexture(this._smoothedTexture);
     gl.deleteFramebuffer(this._intermediateFbo);
     gl.deleteTexture(this._intermediateTexture);
 
     // Clean up BFI frame history resources
     for (const tex of this._historyTextures) gl.deleteTexture(tex);
     for (const fbo of this._historyFbos) gl.deleteFramebuffer(fbo);
-    if (this._srcFbo) gl.deleteFramebuffer(this._srcFbo);
     this._historyTextures = [];
     this._historyFbos = [];
-    this._srcFbo = null;
     this._historyInitialized = false;
   }
 
@@ -409,7 +504,7 @@ export class CRTDisplay {
     }
   }
 
-  /** Allocate 3 history textures + FBOs + source FBO for frame capture. */
+  /** Allocate 3 history textures + FBOs for BFI frame capture. */
   private _initHistory(): void {
     const gl = this._gl;
     const w = this._canvas.width;
@@ -431,9 +526,6 @@ export class CRTDisplay {
       this._historyFbos.push(fbo);
     }
 
-    // Source FBO for reading from ready texture via blitFramebuffer
-    this._srcFbo = gl.createFramebuffer()!;
-
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
     this._historyInitialized = true;
@@ -446,7 +538,7 @@ export class CRTDisplay {
     const h = this._canvas.height;
     const smoothingActive = !this._inputSizeOverride || this._inputSizeOverride[1] > 0;
 
-    // Bind source texture as READ: smoothed intermediate when active, else raw ready
+    // Bind source texture as READ: RGSS intermediate when smoothing active, else raw ready
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._srcFbo);
     const srcTex = smoothingActive ? this._intermediateTexture : this._getReadyTexture();
     gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, srcTex, 0);

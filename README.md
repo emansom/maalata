@@ -47,32 +47,46 @@ Four discrete stages model the full path from input device to screen, each with 
 
 Worst-case: **168ms** (8 + 10 + 125 + 25). Average: **~119ms**. GPU queuing latency is handled by canvas-ultrafast's real WebGL triple-buffer FBOs rather than a simulated delay stage.
 
-### Pixel art smoothing (Kopf-Lischinski)
+### Pixel art smoothing (4x Kopf-Lischinski + RGSS)
 
-A pre-processing pass smooths pre-upscaled pixel art (2x-8x nearest-neighbor) before CRT effects are applied. On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pass corrects.
+A three-pass pre-processing pipeline smooths pixel art before CRT effects are applied. The source image is first upscaled 4× (2× per dimension) via nearest-neighbor, then Kopf-Lischinski smoothing runs at 4× resolution for higher edge precision, and finally RGSS (Rotated Grid SuperSampling) downsamples back to native resolution. Same output resolution as input, vastly better edge quality.
 
-The shader adapts the Kopf-Lischinski depixelization algorithm (SIGGRAPH 2011) for real-time per-fragment WebGL2 rendering, following the GPU architecture of Silva et al. (SIBGRAPI 2013). The full Kopf-Lischinski pipeline requires sequential polygon extraction; this shader extracts the per-pixel-parallel stages and replaces polygon extraction with direct per-fragment color interpolation.
+On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pipeline corrects.
+
+The smoothing shader adapts the Kopf-Lischinski depixelization algorithm (SIGGRAPH 2011) for real-time per-fragment WebGL2 rendering, following the GPU architecture of Silva et al. (SIBGRAPI 2013). The full Kopf-Lischinski pipeline requires sequential polygon extraction; this shader extracts the per-pixel-parallel stages and replaces polygon extraction with direct per-fragment color interpolation.
 
 ```
-Ready Texture (raw pixel art, sRGB, potentially 2x-8x upscaled)
+Ready Texture (raw pixel art, sRGB, W × H)
     |
-[Pass 1: Smoothing shader -> Intermediate FBO]
-    |  Per-fragment Kopf-Lischinski: block detection, YUV similarity
-    |  graph, diagonal crossing resolution, edge-aware interpolation
+[Pass 1: Nearest-neighbor 4x upscale]
+    |  GPU blit: (W×H) → (2W×2H), each source texel becomes 2×2
     |
-Smoothed Texture (anti-aliased edges, sRGB)
+4x Upscaled Texture (2W × 2H)
     |
-[Pass 2: CRT shader -> Screen]
+[Pass 2: Kopf-Lischinski smoothing at 4x]
+    |  Block detection, YUV similarity graph, diagonal crossing
+    |  resolution, edge-aware interpolation — with 4× spatial precision
+    |
+Smoothed 4x Texture (2W × 2H)
+    |
+[Pass 3: RGSS 4x downsample]
+    |  4 rotated grid samples per output pixel — anti-aliased reduction
+    |
+Smoothed Texture (anti-aliased edges, sRGB, W × H)
+    |
+[Pass 4: CRT shader -> Screen]
 ```
 
-Algorithm stages per fragment:
-1. **Block detection** — search up to 8 texels per direction for uniform-color boundaries to find the logical pixel this canvas texel belongs to
+The RGSS downsample uses the same rotated grid pattern as hardware 4× MSAA, with sample offsets at (-3/8,-1/8), (1/8,-3/8), (3/8,1/8), (-1/8,3/8) in output pixel units. This avoids the axis-aligned artifacts of a regular box filter.
+
+Algorithm stages per fragment (Kopf-Lischinski pass):
+1. **Block detection** — search up to 8 texels per direction for uniform-color boundaries to find the logical pixel this canvas texel belongs to (after 4x upscale, original 1-pixel sprites are 2×2 blocks)
 2. **3x3 logical neighborhood** — sample 8 adjacent logical pixels by jumping one texel beyond each detected block boundary
 3. **YUV similarity graph** — compare all neighbor pairs using perceptually-weighted YUV color space (thresholds: Y<=48, U<=7, V<=6 on 0-255 scale)
 4. **Diagonal crossing resolution** — when two diagonals cross at a corner, resolve ambiguity using the valence heuristic (keep sparser diagonal, matching Kopf-Lischinski)
 5. **Edge-aware interpolation** — at block boundaries blend toward connected neighbors; at corners with resolved diagonals apply diagonal cell boundary cut via signed distance function
 
-Early-outs for non-pixel-art content: 1x1 blocks (text, gradients) and interior pixels (far from block edges) pass through unchanged. Bypassed entirely when `_inputSize: [0, 0]` (test mode).
+Early-outs for non-pixel-art content: 1x1 blocks (text, gradients) and interior pixels (far from block edges) pass through unchanged. Bypassed entirely when `_inputSize: [0, 0]` (test mode, skips all three pre-processing passes).
 
 ### CRT post-processing
 
