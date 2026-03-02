@@ -49,20 +49,24 @@ Worst-case: **168ms** (8 + 10 + 125 + 25). Average: **~119ms**. GPU queuing late
 
 ### CRT post-processing
 
-A single combined GLSL fragment shader applies 10 effect stages in an optimized order — all UV modifications happen before any texture reads:
+A single combined GLSL fragment shader applies 12 effect stages in an optimized order — all UV modifications happen before any texture reads:
 
 1. **Barrel distortion + curvature** — screen warp with OOB early-out
 2. **Vertical jitter** — UV offset (conditional)
 3. **Horizontal tearing** — UV offset (conditional)
 4. **Texture sampling** — 4-way branch: BFI x aberration (1/3/3/9 reads)
-5. **Static noise** — time-seeded hash for animated grain
-6. **Glow/bloom** — smoothstep-based (no extra texture reads)
-7. **Signal loss** — scanline-frequency intensity modulation
-8. **Lighting mask** — scanlines + flicker + vignette in a single multiply
-9. **Dot mask** — RGB sub-pixel pattern (float intensity)
-10. **Color** — desaturation, contrast, brightness
+5. **CRT gamma decode** — linearize with γ=2.4 (BT.1886)
+6. **Static noise** — time-seeded hash for animated grain
+7. **Glow/bloom** — smoothstep-based (no extra texture reads)
+8. **Signal loss** — scanline-frequency intensity modulation
+9. **Lighting mask** — scanlines + flicker + vignette in a single multiply
+10. **Dot mask** — RGB sub-pixel pattern (float intensity)
+11. **sRGB gamma encode** — re-encode with γ=2.2 for display
+12. **Color** — desaturation, contrast, brightness (perceptual space)
 
 Every effect block is guarded by a `> 0.0001` threshold check for early-out when disabled. The shader was combined from three MIT-licensed sources — see [Inspiration & prior art](#inspiration--prior-art) for full attribution.
+
+**Colorspace pipeline** — The shader simulates a 2002-era PC CRT monitor on a modern sRGB display. Input is sRGB-encoded (from Canvas 2D API via WebGL RGBA textures — no hardware sRGB conversion). The shader decodes with CRT gamma (γ=2.4, BT.1886 standard for CRT phosphor response), processes physical effects in linear space, then re-encodes with sRGB gamma (γ=2.2). The net gamma of 2.4/2.2 ≈ 1.09 produces the subtle contrast boost characteristic of CRT viewing — midtones render slightly darker, matching what users experienced on real CRT monitors in 2002. No color primary conversion is needed: PC CRT P22 phosphors had primaries nearly identical to sRGB/Rec.709 (unlike TV NTSC/PAL standards which require matrix conversion).
 
 **Black Frame Insertion (BFI)** — On displays running at 120Hz+, a rolling scan simulates CRT phosphor decay using a 3-frame trailing buffer. Hz detection uses an EMA-smoothed `requestAnimationFrame` delta with hysteresis (activate at 120Hz, deactivate below 110Hz). Per-channel overlap intervals and gamma-correct blending prevent banding artifacts.
 

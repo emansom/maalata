@@ -58,6 +58,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **CRT as overlay**: `CRTDisplay` takes over the display loop on the same GL context, reading from `getReadyTexture()`.
 - **Idle shutdown**: Stop CRT/passthrough RAF loop. `preserveDrawingBuffer: true` keeps last frame visible. Resume = restart RAF.
 - **esbuild `mangleProps: /^_/`**: All `_`-prefixed properties are renamed in production. Cross-file methods must NOT use `_` prefix. Each package mangles independently.
+- **CRT colorspace (BT.1886 → sRGB)**: Shader decodes with γ=2.4 (BT.1886 CRT phosphor response), processes effects in linear space, encodes with γ=2.2 (sRGB). Net gamma 1.09 = authentic CRT contrast. No color primary conversion needed (PC P22 phosphors ≈ sRGB). WebGL RGBA textures have no hardware sRGB — all gamma is manual via `pow()`. See `crt-shaders.ts` file header for full rationale.
 
 ### Renderer events
 

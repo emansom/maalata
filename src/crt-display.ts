@@ -65,6 +65,9 @@ const _DEFAULT_CRT_CONFIG: CRTConfig = {
   bfiStrength: 0,
   bfiTargetHz: 60,
   bfiGainVsBlur: 0.7,
+  // CRT gamma pipeline: BT.1886 decode (2.4) + sRGB encode (2.2).
+  // Net gamma 1.09 produces the authentic CRT contrast boost.
+  // See crt-shaders.ts file header for full colorspace rationale.
   crtGamma: 2.4,
   displayGamma: 2.2,
 };

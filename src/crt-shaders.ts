@@ -36,6 +36,39 @@
  * - gingerbeardman's 5-tap bloom intentionally NOT adopted (4 extra texture
  *   reads per fragment); current smoothstep glow is much cheaper.
  * - Noise hash seeded with u_time for temporal variation (animated static).
+ *
+ * CRT colorspace pipeline (BT.1886 → sRGB):
+ *
+ * The shader simulates a 2002-era PC CRT monitor viewed on a modern sRGB display.
+ * Input arrives as sRGB-encoded values from Canvas 2D API via RGBA textures
+ * (canvas-ultrafast uses gl.RGBA8 — no EXT_sRGB, no hardware decode).
+ * Output goes to gl_FragColor which the browser composites as sRGB
+ * (WebGL has no automatic linear-to-sRGB encode on the default framebuffer).
+ *
+ * Pipeline: decode γ=2.4 (BT.1886 CRT) → effects in linear → encode γ=2.2 (sRGB)
+ *
+ * Why γ=2.4 decode (not 2.2):
+ *   BT.1886 (ITU-R, 2011) codifies actual CRT phosphor response as a pure power
+ *   law with γ=2.4. Real PC CRT tubes measured 2.2–2.5; 2.4 is the standard
+ *   reference. The sRGB standard's "effective γ=2.2" is lower because it accounts
+ *   for viewing environment — it was never the CRT's native response.
+ *
+ * Why simple pow() (not piecewise sRGB):
+ *   CRTs had no linear toe segment near black — they clipped to zero. The sRGB
+ *   piecewise curve (linear segment below 0.0031308) was designed for digital
+ *   displays. Using pow() for both decode and encode is more physically accurate.
+ *
+ * Why no color primary conversion:
+ *   2002-era PC monitors used P22 phosphors whose primaries are nearly identical
+ *   to sRGB/Rec.709, both with D65 white point. Color matrix conversion (as done
+ *   by Dolphin emulator for NTSC-M/NTSC-J/PAL TV standards) is not needed for
+ *   PC CRT simulation. See: Dolphin PR #11850, dolphin-emu.org progress report
+ *   May–July 2023.
+ *
+ * Net effect: γ_net = 2.4/2.2 ≈ 1.09 — midtones render ~3% darker, producing
+ * the subtle contrast boost characteristic of CRT viewing. This matches what
+ * users experienced in 2002: sRGB-encoded content displayed on a γ=2.4 tube
+ * was slightly punchier than on today's calibrated sRGB LCDs.
  */
 
 /**
@@ -236,6 +269,9 @@ export const CRT_FRAGMENT_SRC = `
     }
 
     // --- 5. Linearize with CRT gamma (BT.1886) ---
+    // Input from texture2D() is sRGB-encoded (RGBA texture, no hw decode).
+    // Decode with CRT gamma (2.4) to get linear light as a real CRT would produce.
+    // See file header "CRT colorspace pipeline" for full rationale.
     col = crtLinearize(col);
 
     // --- 6. Static noise (Ichiaka, enhanced with temporal variation) ---
@@ -297,6 +333,8 @@ export const CRT_FRAGMENT_SRC = `
     }
 
     // --- 11. Encode with display gamma (sRGB) ---
+    // Re-encode to sRGB for the browser's default framebuffer (no hw encode).
+    // Net gamma 2.4/2.2 = 1.09 produces authentic CRT contrast boost.
     col = crtEncode(col);
 
     // --- 12. Color adjustments (Ichiaka, perceptual/gamma-encoded space) ---
