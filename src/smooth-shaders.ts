@@ -1,9 +1,10 @@
 /**
- * ScaleFX + Sharpsmoother + AA Level2 Pixel Art Smoothing GLSL ES 3.00 Shaders
+ * ScaleFX + Sharpsmoother + Marching Squares Pixel Art Smoothing GLSL ES 3.00 Shaders
  *
- * Eight fragment shaders forming a multi-pass edge-aware pixel art scaler using
+ * Seven fragment shaders forming a multi-pass edge-aware pixel art scaler using
  * Compuphase perceptual color distance, 6-level edge classification with precise
- * slope detection, edge-preserving smoothing, and multi-directional anti-aliasing.
+ * slope detection, edge-preserving smoothing, and contour-based edge anti-aliasing.
+ * All textures use NEAREST filtering exclusively — no hardware bilinear interpolation.
  *
  * Pipeline (all passes use CRT_VERTEX_SRC as vertex shader):
  *   Pass 0: ScaleFX metric — Compuphase color distance to 4 neighbors (W×H → W×H RGBA16F)
@@ -12,8 +13,7 @@
  *   Pass 3: ScaleFX edge level — 6-level classification, subpixel tags (W×H → W×H RGBA8)
  *   Pass 4: ScaleFX 3× output — tag decode → source pixel color lookup (W×H → 3W×3H RGBA8)
  *   Pass 5: Sharpsmoother — edge-preserving 3×3 perceptual-weighted smoothing (3W×3H → 3W×3H)
- *   Pass 6: AA level2 pass 1 — 13-point directional AA (3W×3H → 3W×3H)
- *   Pass 7: AA level2 pass 2 — 4-point diagonal AA (3W×3H → 3W×3H)
+ *   Pass 6: Marching squares — contour-based edge AA (3W×3H → 3W×3H)
  *
  * Texture bindings per pass:
  *   Pass 0: u_source = original input
@@ -21,20 +21,20 @@
  *   Pass 2: u_source = pass 1 strength, u_metricTex = pass 0 metric
  *   Pass 3: u_source = pass 2 ambiguity
  *   Pass 4: u_source = pass 3 edge level, u_originalTex = original input
- *   Pass 5-7: u_source = previous pass output
+ *   Pass 5: u_source = previous pass output
+ *   Pass 6: u_source = pass 5 output, u_originalTex = original input
  *
  * Sources:
  *   ScaleFX (MIT, Sp00kyFox 2016-2017) — edge interpolation specialized in pixel art
  *     https://github.com/libretro/glsl-shaders/tree/master/edge-smoothing/scalefx
  *   Sharpsmoother (GPL v2+, guest(r) 2005-2017) — edge-preserving color smoothing
  *     https://github.com/libretro/glsl-shaders/blob/master/blurs/shaders/sharpsmoother.glsl
- *   AA Shader 4.0 Level2 (GPL v2+, guest(r) 2007-2016) — directional anti-aliasing
- *     https://github.com/libretro/glsl-shaders/tree/master/anti-aliasing/shaders/aa-shader-4.0-level2
  *   Compuphase perceptual color distance — http://www.compuphase.com/cmetric.htm
+ *   Marching squares contour AA — original implementation for maalata
  *
- * Ported from libretro GLSL 1.30 → GLSL ES 3.00 for maalata.
- * Hardcoded preset parameters (xsoft+scalefx-level2aa+sharpsmoother):
- *   SFX_CLR=0.60, SFX_SAA=0.0, SFX_SCN=1.0, AAOFFSET=1.0, AAOFFSET2=0.5
+ * ScaleFX ported from libretro GLSL 1.30 → GLSL ES 3.00 for maalata.
+ * Hardcoded preset parameters (xsoft+scalefx+sharpsmoother):
+ *   SFX_CLR=0.60, SFX_SAA=0.0, SFX_SCN=1.0
  *   Sharpsmoother: max_w=0.10, min_w=-0.07, smoot=0.55, lumad=0.30, mtric=0.70
  */
 
@@ -485,117 +485,132 @@ void main() {
 `;
 
 // ---------------------------------------------------------------------------
-// Pass 6: AA Level2 Pass 1 (3W×3H → 3W×3H RGBA8)
+// Pass 6: Marching Squares edge AA (3W×3H → 3W×3H RGBA8)
 // ---------------------------------------------------------------------------
 
 /**
- * 13-point directional anti-aliasing. Samples diagonal, extended horizontal,
- * and extended vertical neighbors with edge-adaptive inverse-distance weighting.
- * AAOFFSET=1.0. Requires LINEAR texture filtering on input.
+ * Contour-based edge anti-aliasing using marching squares. For each fragment
+ * at 3× resolution: maps to original pixel grid, classifies 2×2 cell corners
+ * as inside/outside using Compuphase color distance, determines contour from
+ * 4-bit case index (16 configurations), computes signed distance to contour,
+ * and blends with smoothstep. Uses only NEAREST texture filtering.
  *
  * Uniforms:
- *   u_source     — pass 5 sharpsmoother output (3W × 3H), texture unit 0
- *   u_sourceSize — upscaled dimensions (3W, 3H)
+ *   u_source       — pass 5 sharpsmoother output (3W × 3H), texture unit 0
+ *   u_originalTex  — original pixel art (W × H), texture unit 1
+ *   u_sourceSize   — upscaled dimensions (3W, 3H)
+ *   u_originalSize — original dimensions (W, H)
  */
-export const AA_LEVEL2_PASS1_FRAGMENT_SRC = `#version 300 es
+export const MARCHING_SQUARES_FRAGMENT_SRC = `#version 300 es
 precision highp float;
 
 in vec2 v_texCoord;
 uniform sampler2D u_source;
+uniform sampler2D u_originalTex;
 uniform vec2 u_sourceSize;
+uniform vec2 u_originalSize;
 out vec4 fragColor;
 
-#define AAOFFSET 1.0
-
-void main() {
-  vec2 texsize = u_sourceSize;
-  float dx = AAOFFSET / texsize.x;
-  float dy = AAOFFSET / texsize.y;
-  vec3 dt = vec3(1.0, 1.0, 1.0);
-
-  vec4 yx = vec4(dx, dy, -dx, -dy);
-  vec4 xh = yx * vec4(4.0, 1.5, 4.0, 1.5);
-  vec4 yv = yx * vec4(1.5, 4.0, 1.5, 4.0);
-
-  vec3 c11 = texture(u_source, v_texCoord).xyz;
-  vec3 s00 = texture(u_source, v_texCoord + yx.zw).xyz;
-  vec3 s20 = texture(u_source, v_texCoord + yx.xw).xyz;
-  vec3 s22 = texture(u_source, v_texCoord + yx.xy).xyz;
-  vec3 s02 = texture(u_source, v_texCoord + yx.zy).xyz;
-  vec3 h00 = texture(u_source, v_texCoord + xh.zw).xyz;
-  vec3 h20 = texture(u_source, v_texCoord + xh.xw).xyz;
-  vec3 h22 = texture(u_source, v_texCoord + xh.xy).xyz;
-  vec3 h02 = texture(u_source, v_texCoord + xh.zy).xyz;
-  vec3 v00 = texture(u_source, v_texCoord + yv.zw).xyz;
-  vec3 v20 = texture(u_source, v_texCoord + yv.xw).xyz;
-  vec3 v22 = texture(u_source, v_texCoord + yv.xy).xyz;
-  vec3 v02 = texture(u_source, v_texCoord + yv.zy).xyz;
-
-  float m1 = 1.0 / (dot(abs(s00 - s22), dt) + 0.00001);
-  float m2 = 1.0 / (dot(abs(s02 - s20), dt) + 0.00001);
-  float h1 = 1.0 / (dot(abs(s00 - h22), dt) + 0.00001);
-  float h2 = 1.0 / (dot(abs(s02 - h20), dt) + 0.00001);
-  float h3 = 1.0 / (dot(abs(h00 - s22), dt) + 0.00001);
-  float h4 = 1.0 / (dot(abs(h02 - s20), dt) + 0.00001);
-  float fv1 = 1.0 / (dot(abs(s00 - v22), dt) + 0.00001);
-  float fv2 = 1.0 / (dot(abs(s02 - v20), dt) + 0.00001);
-  float fv3 = 1.0 / (dot(abs(v00 - s22), dt) + 0.00001);
-  float fv4 = 1.0 / (dot(abs(v02 - s20), dt) + 0.00001);
-
-  vec3 t1 = 0.5 * (m1 * (s00 + s22) + m2 * (s02 + s20)) / (m1 + m2);
-  vec3 t2 = 0.5 * (h1 * (s00 + h22) + h2 * (s02 + h20) + h3 * (h00 + s22) + h4 * (h02 + s20)) / (h1 + h2 + h3 + h4);
-  vec3 t3 = 0.5 * (fv1 * (s00 + v22) + fv2 * (s02 + v20) + fv3 * (v00 + s22) + fv4 * (v02 + s20)) / (fv1 + fv2 + fv3 + fv4);
-
-  float k1 = 1.0 / (dot(abs(t1 - c11), dt) + 0.00001);
-  float k2 = 1.0 / (dot(abs(t2 - c11), dt) + 0.00001);
-  float k3 = 1.0 / (dot(abs(t3 - c11), dt) + 0.00001);
-
-  fragColor = vec4((k1 * t1 + k2 * t2 + k3 * t3) / (k1 + k2 + k3), 1.0);
+// Compuphase perceptual color distance (same as ScaleFX pass 0)
+float dist(vec3 A, vec3 B) {
+  float r = 0.5 * (A.r + B.r);
+  vec3 d = A - B;
+  vec3 c = vec3(2.0 + r, 4.0, 3.0 - r);
+  return sqrt(dot(c * d, d)) / 3.0;
 }
-`;
 
-// ---------------------------------------------------------------------------
-// Pass 7: AA Level2 Pass 2 (3W×3H → 3W×3H RGBA8)
-// ---------------------------------------------------------------------------
-
-/**
- * 4-point diagonal anti-aliasing refinement. Samples at half-pixel diagonal
- * offsets with edge-adaptive weighting. AAOFFSET2=0.5.
- * Requires LINEAR texture filtering on input.
- *
- * Uniforms:
- *   u_source     — pass 6 AA pass 1 output (3W × 3H), texture unit 0
- *   u_sourceSize — upscaled dimensions (3W, 3H)
- */
-export const AA_LEVEL2_PASS2_FRAGMENT_SRC = `#version 300 es
-precision highp float;
-
-in vec2 v_texCoord;
-uniform sampler2D u_source;
-uniform vec2 u_sourceSize;
-out vec4 fragColor;
-
-#define AAOFFSET2 0.5
+// Signed distance from point p to directed line segment a→b
+// Positive = left side (inside), negative = right side (outside)
+float segmentSDF(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a;
+  vec2 ap = p - a;
+  float t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
+  float d = length(ap - t * ab);
+  float cross2d = ab.x * ap.y - ab.y * ap.x;
+  return sign(cross2d) * d;
+}
 
 void main() {
-  vec2 texsize = u_sourceSize;
-  float dx = AAOFFSET2 / texsize.x;
-  float dy = AAOFFSET2 / texsize.y;
-  vec3 dt = vec3(1.0, 1.0, 1.0);
+  // Map to original pixel coordinates (centers at i+0.5)
+  vec2 origPos = v_texCoord * u_originalSize;
+  vec2 cellIdx = floor(origPos - 0.5);
+  vec2 lp = origPos - cellIdx - 0.5;  // local [0,1]×[0,1]
+  vec2 ci = clamp(cellIdx, vec2(0.0), u_originalSize - 2.0);
 
-  vec2 UL = v_texCoord + vec2(-dx, -dy);
-  vec2 UR = v_texCoord + vec2( dx, -dy);
-  vec2 DL = v_texCoord + vec2(-dx,  dy);
-  vec2 DR = v_texCoord + vec2( dx,  dy);
+  // Fetch 4 corner colors from original texture
+  vec2 texelOrig = 1.0 / u_originalSize;
+  vec3 cTL = texture(u_originalTex, (ci + vec2(0.5, 0.5)) * texelOrig).rgb;
+  vec3 cTR = texture(u_originalTex, (ci + vec2(1.5, 0.5)) * texelOrig).rgb;
+  vec3 cBL = texture(u_originalTex, (ci + vec2(0.5, 1.5)) * texelOrig).rgb;
+  vec3 cBR = texture(u_originalTex, (ci + vec2(1.5, 1.5)) * texelOrig).rgb;
 
-  vec3 c00 = texture(u_source, UL).xyz;
-  vec3 c20 = texture(u_source, UR).xyz;
-  vec3 c02 = texture(u_source, DL).xyz;
-  vec3 c22 = texture(u_source, DR).xyz;
+  vec3 fragRGB = texture(u_source, v_texCoord).rgb;
 
-  float m1 = dot(abs(c00 - c22), dt) + 0.001;
-  float m2 = dot(abs(c02 - c20), dt) + 0.001;
+  // Perceptual distances from corners to fragment color
+  float dTL = dist(cTL, fragRGB);
+  float dTR = dist(cTR, fragRGB);
+  float dBL = dist(cBL, fragRGB);
+  float dBR = dist(cBR, fragRGB);
 
-  fragColor = vec4((m1 * (c02 + c20) + m2 * (c22 + c00)) / (2.0 * (m1 + m2)), 1.0);
+  const float THRESHOLD = 0.12;
+  int bTL = dTL < THRESHOLD ? 1 : 0;
+  int bTR = dTR < THRESHOLD ? 1 : 0;
+  int bBL = dBL < THRESHOLD ? 1 : 0;
+  int bBR = dBR < THRESHOLD ? 1 : 0;
+  int ci4 = bTL | (bTR << 1) | (bBL << 2) | (bBR << 3);
+
+  // No contour: all same classification
+  if (ci4 == 0 || ci4 == 15) {
+    fragColor = vec4(fragRGB, 1.0);
+    return;
+  }
+
+  // Edge crossing positions via linear interpolation
+  float tTop   = dTL / (dTL + dTR + 0.0001);
+  float tBot   = dBL / (dBL + dBR + 0.0001);
+  float tLeft  = dTL / (dTL + dBL + 0.0001);
+  float tRight = dTR / (dTR + dBR + 0.0001);
+  vec2 xTop = vec2(tTop, 0.0), xBot = vec2(tBot, 1.0);
+  vec2 xLeft = vec2(0.0, tLeft), xRight = vec2(1.0, tRight);
+
+  // Signed distance per case (inside = positive, outside = negative)
+  float sd = 0.0;
+  if      (ci4 == 1)  sd = segmentSDF(lp, xTop, xLeft);
+  else if (ci4 == 2)  sd = segmentSDF(lp, xRight, xTop);
+  else if (ci4 == 3)  sd = segmentSDF(lp, xRight, xLeft);
+  else if (ci4 == 4)  sd = segmentSDF(lp, xLeft, xBot);
+  else if (ci4 == 5)  sd = segmentSDF(lp, xTop, xBot);
+  else if (ci4 == 6) {  // saddle TR+BL
+    float cd = 0.25 * (dTL + dTR + dBL + dBR);
+    sd = cd < THRESHOLD
+      ? min(segmentSDF(lp, xLeft, xTop), segmentSDF(lp, xRight, xBot))
+      : max(segmentSDF(lp, xRight, xTop), segmentSDF(lp, xLeft, xBot));
+  }
+  else if (ci4 == 7)  sd = segmentSDF(lp, xRight, xBot);
+  else if (ci4 == 8)  sd = segmentSDF(lp, xBot, xRight);
+  else if (ci4 == 9) {  // saddle TL+BR
+    float cd = 0.25 * (dTL + dTR + dBL + dBR);
+    sd = cd < THRESHOLD
+      ? min(segmentSDF(lp, xTop, xRight), segmentSDF(lp, xBot, xLeft))
+      : max(segmentSDF(lp, xTop, xLeft), segmentSDF(lp, xBot, xRight));
+  }
+  else if (ci4 == 10) sd = segmentSDF(lp, xBot, xTop);
+  else if (ci4 == 11) sd = segmentSDF(lp, xBot, xLeft);
+  else if (ci4 == 12) sd = segmentSDF(lp, xLeft, xRight);
+  else if (ci4 == 13) sd = segmentSDF(lp, xTop, xRight);
+  else if (ci4 == 14) sd = segmentSDF(lp, xLeft, xTop);
+
+  // Anti-aliased blend (1/3 cell width = 1 subpixel transition)
+  float blend = smoothstep(-0.333, 0.333, sd);
+
+  // Outside color: nearest differing original pixel's center subpixel
+  vec3 outsideColor = fragRGB;
+  float bestOutDist = 1e10;
+  if (bTL == 0 && dTL < bestOutDist) { bestOutDist = dTL; outsideColor = texture(u_source, (ci + vec2(0.5, 0.5)) / u_originalSize).rgb; }
+  if (bTR == 0 && dTR < bestOutDist) { bestOutDist = dTR; outsideColor = texture(u_source, (ci + vec2(1.5, 0.5)) / u_originalSize).rgb; }
+  if (bBL == 0 && dBL < bestOutDist) { bestOutDist = dBL; outsideColor = texture(u_source, (ci + vec2(0.5, 1.5)) / u_originalSize).rgb; }
+  if (bBR == 0 && dBR < bestOutDist) { bestOutDist = dBR; outsideColor = texture(u_source, (ci + vec2(1.5, 1.5)) / u_originalSize).rgb; }
+
+  fragColor = vec4(mix(outsideColor, fragRGB, blend), 1.0);
 }
 `;

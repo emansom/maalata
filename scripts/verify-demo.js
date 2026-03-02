@@ -354,9 +354,6 @@ async function main() {
       }
     }
 
-    // Keep renderer alive — hover resets the 60s idle timer
-    await canvas.hover({ position: { x: 400, y: 200 } });
-
     // E2E: Grayscale monotonicity
     console.log(`\n${tag} E2E: Grayscale monotonicity...`);
     {
@@ -376,9 +373,6 @@ async function main() {
       }
       if (monoOk) console.log(`${tag}   Grayscale monotonicity OK`);
     }
-
-    // Keep renderer alive — hover resets the 60s idle timer
-    await canvas.hover({ position: { x: 400, y: 200 } });
 
     // E2E: Gamma curve (default config, wider tolerance)
     console.log(`\n${tag} E2E: Gamma curve (default config)...`);
@@ -415,9 +409,6 @@ async function main() {
         console.warn(`${tag}   Not enough data points for gamma regression`);
       }
     }
-
-    // Keep renderer alive — hover resets the 60s idle timer
-    await canvas.hover({ position: { x: 400, y: 200 } });
 
     // --- Unit tests: disable smoothing for clean CRT-only measurements ---
     // Smoothing defaults to true; disable for isolated CRT shader testing.
@@ -547,13 +538,9 @@ async function main() {
       }
     }
 
-    // Re-enable smoothing after unit tests
-    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
-    await page.evaluate(() => window.maalataRenderer.setSmoothing(true));
-    /* eslint-enable no-undef */
-
-    // --- Unit test: BFI activation at simulated 120Hz ---
-    console.log(`\n${tag} Unit: BFI activation at simulated 120Hz...`);
+    // --- Unit test: BFI activation at simulated 120Hz (CRT-only) ---
+    // Smoothing is still disabled from unit tests above
+    console.log(`\n${tag} Unit: BFI activation at simulated 120Hz (CRT-only)...`);
     {
       // Enable BFI config
       await applyConfig(page, { ...NEUTRAL_CRT, bfiStrength: 0.5, bfiTargetHz: 60 });
@@ -596,13 +583,73 @@ async function main() {
       console.log(`${tag}   BFI active: ${bfiResult.bfiActive}, Hz: ${bfiResult.measuredHz.toFixed(1)}, history: ${bfiResult.historyInitialized}`);
 
       if (!bfiResult.bfiActive) {
-        errors.push('[Unit BFI] BFI should be active at simulated 120Hz');
+        errors.push('[Unit BFI CRT-only] BFI should be active at simulated 120Hz');
       }
       if (bfiResult.measuredHz < 110) {
-        errors.push(`[Unit BFI] Measured Hz ${bfiResult.measuredHz.toFixed(1)} < 110`);
+        errors.push(`[Unit BFI CRT-only] Measured Hz ${bfiResult.measuredHz.toFixed(1)} < 110`);
       }
       if (!bfiResult.historyInitialized) {
-        errors.push('[Unit BFI] History textures should be initialized');
+        errors.push('[Unit BFI CRT-only] History textures should be initialized');
+      }
+    }
+
+    // Re-enable smoothing for CRT+smoothing BFI test
+    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+    await page.evaluate(() => window.maalataRenderer.setSmoothing(true));
+    /* eslint-enable no-undef */
+
+    // --- Unit test: BFI activation at simulated 120Hz (CRT+smoothing) ---
+    console.log(`\n${tag} Unit: BFI activation at simulated 120Hz (CRT+smoothing)...`);
+    {
+      await applyConfig(page, { ...NEUTRAL_CRT, bfiStrength: 0.5, bfiTargetHz: 60 });
+
+      /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+      const bfiResult = await page.evaluate(async () => {
+        const renderer = window.maalataRenderer;
+        const crt = renderer._crtDisplay;
+
+        crt.stop();
+
+        // Reset Hz state — real RAF frames between setSmoothing(true) and
+        // stop() set _lastFrameTime to a real timestamp. Without reset, the
+        // shimmed performance.now (~1000) creates a negative delta against
+        // the large real timestamp.
+        crt._lastFrameTime = 0;
+        crt._smoothDelta = 0;
+        crt._bfiActive = false;
+
+        let simTime = 1000;
+        const realNow = performance.now.bind(performance);
+        performance.now = () => simTime;
+
+        for (let i = 0; i < 50; i++) {
+          simTime += 8.33;
+          crt._frameCount = (crt._frameCount + 1) % 100000;
+          crt._updateHz();
+        }
+
+        const result = {
+          bfiActive: crt._bfiActive,
+          measuredHz: crt._measuredHz,
+          historyInitialized: crt._historyInitialized,
+        };
+
+        performance.now = realNow;
+        crt.start();
+        return result;
+      });
+      /* eslint-enable no-undef */
+
+      console.log(`${tag}   BFI active: ${bfiResult.bfiActive}, Hz: ${bfiResult.measuredHz.toFixed(1)}, history: ${bfiResult.historyInitialized}`);
+
+      if (!bfiResult.bfiActive) {
+        errors.push('[Unit BFI CRT+smoothing] BFI should be active at simulated 120Hz');
+      }
+      if (bfiResult.measuredHz < 110) {
+        errors.push(`[Unit BFI CRT+smoothing] Measured Hz ${bfiResult.measuredHz.toFixed(1)} < 110`);
+      }
+      if (!bfiResult.historyInitialized) {
+        errors.push('[Unit BFI CRT+smoothing] History textures should be initialized');
       }
     }
 

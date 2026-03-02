@@ -1,0 +1,6 @@
+Remove backward-compatible no-op events canvas-replacing and canvas-replaced
+Ensure gl.NEAREST filtering is used for all WebGL textures
+If the CRT shader is enabled, it should always run and only stop and resume on tab focus change, no time based idle timeout for the CRT shader as it is emulating a real display
+Remove legacy/backwards compatible and irrelevant code, documentation and comments
+There should be two BFI tests: one with CRT enabled and another one with CRT and smoothing enabled, both should pass!
+Modify the ScaleFX or Sharpsmoother, modify it where it makes more sense to modify it, to use a marching squares method to smooth all pixel stair stepping and shapes as described in this blog: https://nature-architects.com/en/blog/2424/ the goal is to get rid of all hard / rough pixel lines and be left with only smooth lines both before the downsample and after the downsample

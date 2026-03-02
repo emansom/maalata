@@ -47,16 +47,16 @@ Four discrete stages model the full path from input device to screen, each with 
 
 Worst-case: **168ms** (8 + 10 + 125 + 25). Average: **~119ms**. GPU queuing latency is handled by canvas-ultrafast's real WebGL triple-buffer FBOs rather than a simulated delay stage.
 
-### Pixel art smoothing (ScaleFX + sharpsmoother + AA level2 + EWA smooth)
+### Pixel art smoothing (ScaleFX + sharpsmoother + marching squares + EWA smooth)
 
 maalata targets 1:1 pixel art — consumers draw at native resolution and get improved visuals automatically, no code changes needed. The library handles all internal upscaling and smoothing transparently.
 
-**Pixel-perfect rendering** — maalata is designed for pixel art canvases. All WebGL textures use `gl.NEAREST` (nearest-neighbor) filtering and the canvas element uses CSS `image-rendering: pixelated`. Together with canvas-ultrafast's `imageSmoothingEnabled: false` default, this eliminates bilinear interpolation at every stage — from WebGL texture sampling through browser compositing. The WebGL output is always the same size as the canvas input; all internal upscaling is purely in GPU FBOs.
+**Pixel-perfect rendering** — maalata is designed for pixel art canvases. All WebGL textures across canvas-ultrafast and maalata use `gl.NEAREST` (nearest-neighbor) filtering — no hardware bilinear interpolation at any stage. The canvas element uses CSS `image-rendering: pixelated`. Together with canvas-ultrafast's `imageSmoothingEnabled: false` default, this eliminates smoothing from WebGL texture sampling through browser compositing. The WebGL output is always the same size as the canvas input; all internal upscaling is purely in GPU FBOs.
 
-A nine-pass pre-processing pipeline smooths pixel art edges using ScaleFX (Sp00kyFox), sharpsmoother (guest(r)), and AA level2 (guest(r)), producing SVG-quality smoothing for pixel art. ScaleFX performs 6-level edge classification with precise slope detection using Compuphase perceptual color distance, outputting at 3× scale. Sharpsmoother adds edge-preserving color blending. AA level2 provides two-pass directional anti-aliasing. An EWA smooth downsample (raised-cosine polar filter, no negative lobes) reduces back to native resolution with maximum smoothness and zero ringing. Same output resolution as input, completely smooth edges with no visible staircase artifacts. Purely algorithmic — no lookup tables or async loading needed.
+An eight-pass pre-processing pipeline smooths pixel art edges using ScaleFX (Sp00kyFox), sharpsmoother (guest(r)), and marching squares contour AA, producing SVG-quality smoothing for pixel art. ScaleFX performs 6-level edge classification with precise slope detection using Compuphase perceptual color distance, outputting at 3× scale. Sharpsmoother adds edge-preserving color blending. Marching squares provides contour-based edge anti-aliasing using signed distance fields — classifies 2×2 original pixel cells, computes contour positions, and blends via smoothstep. An EWA smooth downsample (raised-cosine polar filter, no negative lobes) reduces back to native resolution with maximum smoothness and zero ringing. Same output resolution as input, completely smooth edges with no visible staircase artifacts. Purely algorithmic — no lookup tables or async loading needed.
 
 The smoothing pipeline is implemented as a standalone `SmoothingDisplay` class that can be used in two modes, both configurable at init and toggleable at runtime:
-- **With CRT** (`crt: true, smoothing: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-8, then applies CRT effects on the smoothed output.
+- **With CRT** (`crt: true, smoothing: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-7, then applies CRT effects on the smoothed output.
 - **Standalone** (`crt: false, smoothing: true`): `SmoothingDisplay` runs its own RAF loop and blits smoothed output directly to screen — pixel art edge smoothing without the retro CRT look.
 
 On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pipeline corrects.
@@ -88,24 +88,20 @@ Ready Texture (raw pixel art, sRGB, W × H)
 [Pass 5: Sharpsmoother]
     |  3×3 perceptual-weighted edge-preserving smoothing (3W×3H → 3W×3H)
     |
-[Pass 6: AA level2 pass 1]
-    |  13-point directional AA (diagonal + horizontal + vertical extended)
-    |  LINEAR texture filtering (3W×3H → 3W×3H)
+[Pass 6: Marching squares]
+    |  Contour-based edge AA: 2×2 cell classification, SDF blending
+    |  Reads pass 5 + original input, NEAREST only (3W×3H → 3W×3H)
     |
-[Pass 7: AA level2 pass 2]
-    |  4-point diagonal AA (half-pixel offset weighted blend)
-    |  LINEAR texture filtering (3W×3H → 3W×3H)
-    |
-[Pass 8: EWA smooth downsample]
+[Pass 7: EWA smooth downsample]
     |  Raised-cosine 8×8 polar downsample, no negative lobes
     |  SUPPORT=1.5, u_downscaleFactor=3.0 (3W×3H → W×H)
     |
 Smoothed Texture (anti-aliased edges, sRGB, W × H)
     |
-[Pass 9: CRT shader -> Screen]
+[Pass 8: CRT shader -> Screen]
 ```
 
-Total VRAM for the smoothing pipeline is 25 WH (2× RGBA16F W×H + 2× RGBA8 W×H + 2× RGBA8 3W×3H + 1× RGBA8 W×H). Requires `EXT_color_buffer_float` WebGL2 extension (99%+ support).
+Total VRAM for the smoothing pipeline is 25 WH (2× RGBA16F W×H + 2× RGBA8 W×H + 2× RGBA8 3W×3H + 1× RGBA8 W×H). Requires `EXT_color_buffer_float` WebGL2 extension (99%+ support). All textures use NEAREST filtering exclusively.
 
 The EWA smooth downsample uses a raised-cosine envelope with polar distance — no negative lobes means zero ringing and maximum smoothness. 8×8 grid (64 taps), SUPPORT=1.5 output pixel radius. At `u_downscaleFactor=3.0` (main pipeline): halfScale=1.5, support extends to 2.25 source texels from center, ~32 of 64 samples contribute. At `u_downscaleFactor=1.5` (for `screenshotUpscaled()` 3×→2×): halfScale=0.75, ~16 of 64 samples contribute. The kernel adapts automatically via `u_downscaleFactor`.
 
@@ -200,7 +196,7 @@ ctx.fillText('Hello from 2002', 20, 35);
 
 // Events
 renderer.on('ready', () => { /* initial render */ });
-renderer.on('suspending', ({ done }) => { /* idle shutdown after 60s — clean up, call done() */ });
+renderer.on('suspending', ({ done }) => { /* idle shutdown (when CRT disabled) — clean up, call done() */ });
 renderer.on('resuming', () => { /* transparent restart on next interaction */ });
 
 // Cleanup
@@ -260,9 +256,9 @@ The combined fragment shader draws from three MIT-licensed implementations:
 ### Pixel art smoothing
 
 - **Sp00kyFox** (2016-2017) — ScaleFX edge interpolation specialized in pixel art (MIT): 6-level edge classification, Compuphase perceptual color distance, subpixel tag assignment
-- **guest(r)** (2005-2017) — Sharpsmoother edge-preserving color smoothing (GPL v2+), AA Shader 4.0 Level2 directional anti-aliasing (GPL v2+)
-- **[libretro/glsl-shaders](https://github.com/libretro/glsl-shaders)** — GLSL reference implementations: [ScaleFX](https://github.com/libretro/glsl-shaders/tree/master/edge-smoothing/scalefx) (MIT), [sharpsmoother](https://github.com/libretro/glsl-shaders/blob/master/blurs/shaders/sharpsmoother.glsl) (GPL v2+), [aa-shader-4.0-level2](https://github.com/libretro/glsl-shaders/tree/master/anti-aliasing/shaders/aa-shader-4.0-level2) (GPL v2+)
-- **Compuphase** — [Perceptual color distance metric](http://www.compuphase.com/cmetric.htm) used by ScaleFX
+- **guest(r)** (2005-2017) — Sharpsmoother edge-preserving color smoothing (GPL v2+)
+- **[libretro/glsl-shaders](https://github.com/libretro/glsl-shaders)** — GLSL reference implementations: [ScaleFX](https://github.com/libretro/glsl-shaders/tree/master/edge-smoothing/scalefx) (MIT), [sharpsmoother](https://github.com/libretro/glsl-shaders/blob/master/blurs/shaders/sharpsmoother.glsl) (GPL v2+)
+- **Compuphase** — [Perceptual color distance metric](http://www.compuphase.com/cmetric.htm) used by ScaleFX and marching squares
 
 ### Rendering backend
 

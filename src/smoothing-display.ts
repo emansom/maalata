@@ -1,14 +1,12 @@
 /**
  * Standalone Pixel Art Smoothing Display
  *
- * Nine-pass rendering pipeline that smooths pixel art edges without CRT
+ * Eight-pass rendering pipeline that smooths pixel art edges without CRT
  * effects. Targets 1:1 pixel art — consumers draw at native resolution and
  * get improved visuals automatically, no code changes needed.
  *
- * NEAREST filtering is inherited from canvas-ultrafast (all FBO textures use
- * gl.NEAREST by default). AA level2 passes (6, 7) temporarily switch input
- * textures to LINEAR for fractional-texel bilinear interpolation, then
- * restore NEAREST after rendering.
+ * All textures use NEAREST filtering exclusively — no hardware bilinear
+ * interpolation.
  *
  *   Pass 0: ScaleFX metric — Compuphase color distance (W×H → W×H RGBA16F)
  *   Pass 1: ScaleFX strength — corner interpolation (W×H → W×H RGBA16F)
@@ -16,24 +14,24 @@
  *   Pass 3: ScaleFX edge level — 6-level classification (W×H → W×H RGBA8)
  *   Pass 4: ScaleFX 3× output — tag decode → color lookup (W×H → 3W×3H RGBA8)
  *   Pass 5: Sharpsmoother — edge-preserving smoothing (3W×3H → 3W×3H RGBA8)
- *   Pass 6: AA level2 pass 1 — 13-point directional AA (3W×3H → 3W×3H RGBA8)
- *   Pass 7: AA level2 pass 2 — 4-point diagonal AA (3W×3H → 3W×3H RGBA8)
- *   Pass 8: EWA smooth downsample — raised-cosine polar 8×8 (3W×3H → W×H RGBA8)
+ *   Pass 6: Marching squares — contour-based edge AA (3W×3H → 3W×3H RGBA8)
+ *   Pass 7: EWA smooth downsample — raised-cosine polar 8×8 (3W×3H → W×H RGBA8)
  *
  * Can be used standalone (render() blits to screen) or as a delegate inside
  * CRTDisplay (renderSmoothing() + getSmoothedTexture() for CRT to read).
  *
  * screenshotUpscaled() uses the EWA smooth downsample shader on the GPU to
- * reduce the 3W×3H post-AA FBO to 2W×2H, then reads via readPixels and
- * returns as an ImageBitmap — useful for visualizing the ScaleFX+AA output
- * at 2× resolution.
+ * reduce the 3W×3H post-marching-squares FBO to 2W×2H, then reads via
+ * readPixels and returns as an ImageBitmap — useful for visualizing the
+ * ScaleFX+marching-squares output at 2× resolution.
  *
  * ScaleFX uses Compuphase perceptual color distance with 6-level edge
  * classification and precise slope detection. Passes 0-3 output packed
  * metadata (not colors); pass 4 reads original pixels and maps 3×3 subpixel
  * grid to source colors. Sharpsmoother adds edge-preserving color blending.
- * AA level2 provides multi-directional anti-aliasing refinement. Purely
- * algorithmic — no lookup tables or async loading needed.
+ * Marching squares provides contour-based edge anti-aliasing using signed
+ * distance fields. Purely algorithmic — no lookup tables or async loading
+ * needed.
  *
  * Total VRAM: 25 WH (2×RGBA16F W×H + 2×RGBA8 W×H + 2×RGBA8 3W×3H + 1×RGBA8 W×H).
  * Requires EXT_color_buffer_float for RGBA16F render targets (99%+ WebGL2).
@@ -47,8 +45,7 @@ import {
   SCALEFX_PASS3_FRAGMENT_SRC,
   SCALEFX_PASS4_FRAGMENT_SRC,
   SHARPSMOOTHER_FRAGMENT_SRC,
-  AA_LEVEL2_PASS1_FRAGMENT_SRC,
-  AA_LEVEL2_PASS2_FRAGMENT_SRC,
+  MARCHING_SQUARES_FRAGMENT_SRC,
 } from './smooth-shaders';
 import { DOWNSAMPLE_FRAGMENT_SRC } from './downsample-shaders';
 
@@ -62,16 +59,15 @@ export class SmoothingDisplay {
   // Fullscreen quad VBO (shared by all programs)
   private _quadVBO: WebGLBuffer;
 
-  // --- 9 shader programs ---
+  // --- 8 shader programs ---
   private _pass0Program: WebGLProgram;  // ScaleFX metric
   private _pass1Program: WebGLProgram;  // ScaleFX strength
   private _pass2Program: WebGLProgram;  // ScaleFX ambiguity
   private _pass3Program: WebGLProgram;  // ScaleFX edge level
   private _pass4Program: WebGLProgram;  // ScaleFX 3× output
   private _pass5Program: WebGLProgram;  // Sharpsmoother
-  private _pass6Program: WebGLProgram;  // AA level2 pass 1
-  private _pass7Program: WebGLProgram;  // AA level2 pass 2
-  private _pass8Program: WebGLProgram;  // EWA smooth downsample
+  private _pass6Program: WebGLProgram;  // Marching squares
+  private _pass7Program: WebGLProgram;  // EWA smooth downsample
 
   // --- Uniform locations ---
   private _pass0SourceSizeLoc: WebGLUniformLocation | null;
@@ -93,14 +89,12 @@ export class SmoothingDisplay {
   private _pass5PositionLoc: number;
 
   private _pass6SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass6OriginalSizeLoc: WebGLUniformLocation | null;
   private _pass6PositionLoc: number;
 
   private _pass7SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass7DownscaleFactorLoc: WebGLUniformLocation | null;
   private _pass7PositionLoc: number;
-
-  private _pass8SourceSizeLoc: WebGLUniformLocation | null;
-  private _pass8DownscaleFactorLoc: WebGLUniformLocation | null;
-  private _pass8PositionLoc: number;
 
   // --- FBO textures ---
   private _metricTexture: WebGLTexture;      // W×H RGBA16F (pass 0 output)
@@ -200,30 +194,24 @@ export class SmoothingDisplay {
     this._pass5PositionLoc = gl.getAttribLocation(this._pass5Program, 'a_position');
     gl.uniform1i(gl.getUniformLocation(this._pass5Program, 'u_source'), 0);
 
-    // --- Pass 6: AA level2 pass 1 ---
+    // --- Pass 6: Marching squares ---
     this._pass6Program = this._createShaderProgram(
-      CRT_VERTEX_SRC, AA_LEVEL2_PASS1_FRAGMENT_SRC);
+      CRT_VERTEX_SRC, MARCHING_SQUARES_FRAGMENT_SRC);
     gl.useProgram(this._pass6Program);
     this._pass6SourceSizeLoc = gl.getUniformLocation(this._pass6Program, 'u_sourceSize');
+    this._pass6OriginalSizeLoc = gl.getUniformLocation(this._pass6Program, 'u_originalSize');
     this._pass6PositionLoc = gl.getAttribLocation(this._pass6Program, 'a_position');
     gl.uniform1i(gl.getUniformLocation(this._pass6Program, 'u_source'), 0);
+    gl.uniform1i(gl.getUniformLocation(this._pass6Program, 'u_originalTex'), 1);
 
-    // --- Pass 7: AA level2 pass 2 ---
+    // --- Pass 7: EWA smooth downsample ---
     this._pass7Program = this._createShaderProgram(
-      CRT_VERTEX_SRC, AA_LEVEL2_PASS2_FRAGMENT_SRC);
+      CRT_VERTEX_SRC, DOWNSAMPLE_FRAGMENT_SRC);
     gl.useProgram(this._pass7Program);
     this._pass7SourceSizeLoc = gl.getUniformLocation(this._pass7Program, 'u_sourceSize');
+    this._pass7DownscaleFactorLoc = gl.getUniformLocation(this._pass7Program, 'u_downscaleFactor');
     this._pass7PositionLoc = gl.getAttribLocation(this._pass7Program, 'a_position');
-    gl.uniform1i(gl.getUniformLocation(this._pass7Program, 'u_source'), 0);
-
-    // --- Pass 8: EWA smooth downsample ---
-    this._pass8Program = this._createShaderProgram(
-      CRT_VERTEX_SRC, DOWNSAMPLE_FRAGMENT_SRC);
-    gl.useProgram(this._pass8Program);
-    this._pass8SourceSizeLoc = gl.getUniformLocation(this._pass8Program, 'u_sourceSize');
-    this._pass8DownscaleFactorLoc = gl.getUniformLocation(this._pass8Program, 'u_downscaleFactor');
-    this._pass8PositionLoc = gl.getAttribLocation(this._pass8Program, 'a_position');
-    gl.uniform1i(gl.getUniformLocation(this._pass8Program, 'u_texture'), 0);
+    gl.uniform1i(gl.getUniformLocation(this._pass7Program, 'u_texture'), 0);
 
     // --- Create FBO textures ---
 
@@ -259,7 +247,7 @@ export class SmoothingDisplay {
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
-  /** Run passes 0-8 (ScaleFX → sharpsmoother → AA → EWA downsample) into internal FBO. */
+  /** Run passes 0-7 (ScaleFX → sharpsmoother → marching squares → EWA downsample) into internal FBO. */
   renderSmoothing(): void {
     const gl = this._gl;
     const w = this._canvas.width;
@@ -338,47 +326,29 @@ export class SmoothingDisplay {
     gl.vertexAttribPointer(this._pass5PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // --- Pass 6: AA level2 pass 1 (upscaledB → upscaledA, 3W×3H, LINEAR) ---
+    // --- Pass 6: Marching squares (upscaledB + original → upscaledA, 3W×3H) ---
     gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledAFbo);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
-    // AA passes need LINEAR filtering for fractional texel offsets
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, readyTex);
     gl.useProgram(this._pass6Program);
     gl.uniform2f(this._pass6SourceSizeLoc!, w3, h3);
+    gl.uniform2f(this._pass6OriginalSizeLoc!, w, h);
     gl.enableVertexAttribArray(this._pass6PositionLoc);
     gl.vertexAttribPointer(this._pass6PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-    // Restore NEAREST
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-    // --- Pass 7: AA level2 pass 2 (upscaledA → upscaledB, 3W×3H, LINEAR) ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledBFbo);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this._upscaledA);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.useProgram(this._pass7Program);
-    gl.uniform2f(this._pass7SourceSizeLoc!, w3, h3);
-    gl.enableVertexAttribArray(this._pass7PositionLoc);
-    gl.vertexAttribPointer(this._pass7PositionLoc, 2, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    // Restore NEAREST
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-
-    // --- Pass 8: EWA smooth downsample (upscaledB → intermediateTex, W×H) ---
+    // --- Pass 7: EWA smooth downsample (upscaledA → intermediateTex, W×H) ---
     gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
     gl.viewport(0, 0, w, h);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
-    gl.useProgram(this._pass8Program);
-    gl.uniform2f(this._pass8SourceSizeLoc!, w3, h3);
-    gl.uniform1f(this._pass8DownscaleFactorLoc!, 3.0);
-    gl.enableVertexAttribArray(this._pass8PositionLoc);
-    gl.vertexAttribPointer(this._pass8PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledA);
+    gl.useProgram(this._pass7Program);
+    gl.uniform2f(this._pass7SourceSizeLoc!, w3, h3);
+    gl.uniform1f(this._pass7DownscaleFactorLoc!, 3.0);
+    gl.enableVertexAttribArray(this._pass7PositionLoc);
+    gl.vertexAttribPointer(this._pass7PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
     gl.enable(gl.BLEND);
@@ -421,9 +391,9 @@ export class SmoothingDisplay {
   }
 
   /**
-   * GPU-downsample the 3W×3H post-AA FBO to 2W×2H using the EWA smooth
-   * downsample shader at u_downscaleFactor=1.5, then read via readPixels
-   * and return as an ImageBitmap.
+   * GPU-downsample the 3W×3H post-marching-squares FBO to 2W×2H using the
+   * EWA smooth downsample shader at u_downscaleFactor=1.5, then read via
+   * readPixels and return as an ImageBitmap.
    */
   async screenshotUpscaled(): Promise<ImageBitmap> {
     if (this._hasContent()) this.renderSmoothing();
@@ -439,14 +409,14 @@ export class SmoothingDisplay {
     // Render through EWA smooth downsample at 1.5× scale (3W×3H → 2W×2H)
     gl.viewport(0, 0, w2, h2);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
-    gl.useProgram(this._pass8Program);
-    gl.uniform2f(this._pass8SourceSizeLoc!, w3, h3);
-    gl.uniform1f(this._pass8DownscaleFactorLoc!, 1.5);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledA);
+    gl.useProgram(this._pass7Program);
+    gl.uniform2f(this._pass7SourceSizeLoc!, w3, h3);
+    gl.uniform1f(this._pass7DownscaleFactorLoc!, 1.5);
     gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
-    gl.enableVertexAttribArray(this._pass8PositionLoc);
+    gl.enableVertexAttribArray(this._pass7PositionLoc);
     gl.vertexAttribPointer(
-      this._pass8PositionLoc, 2, gl.FLOAT, false, 0, 0);
+      this._pass7PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.disable(gl.BLEND);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.enable(gl.BLEND);
@@ -478,7 +448,7 @@ export class SmoothingDisplay {
     this.stop();
     const gl = this._gl;
 
-    // Delete 9 programs
+    // Delete 8 programs
     gl.deleteProgram(this._pass0Program);
     gl.deleteProgram(this._pass1Program);
     gl.deleteProgram(this._pass2Program);
@@ -487,7 +457,6 @@ export class SmoothingDisplay {
     gl.deleteProgram(this._pass5Program);
     gl.deleteProgram(this._pass6Program);
     gl.deleteProgram(this._pass7Program);
-    gl.deleteProgram(this._pass8Program);
 
     // Delete quad VBO
     gl.deleteBuffer(this._quadVBO);

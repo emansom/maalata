@@ -6,7 +6,7 @@ interface CanvasButton {
   action: () => void;
 }
 
-let pageCanvas = document.getElementById('canvas') as HTMLCanvasElement;
+const pageCanvas = document.getElementById('canvas') as HTMLCanvasElement;
 if (!pageCanvas) throw new Error('Canvas element not found');
 
 async function initializeDemo() {
@@ -182,24 +182,12 @@ async function initializeDemo() {
     pageCanvas.style.cursor = overButton ? 'pointer' : 'default';
   }
 
-  function attachClickHandlers() {
-    pageCanvas.addEventListener('click', handleCanvasClick);
-    pageCanvas.addEventListener('mousemove', handleCanvasMouseMove);
-  }
-  function detachClickHandlers() {
-    pageCanvas.removeEventListener('click', handleCanvasClick);
-    pageCanvas.removeEventListener('mousemove', handleCanvasMouseMove);
-  }
-
-  renderer.on('canvas-replacing', ({ done }) => { detachClickHandlers(); done(); });
-  renderer.on('canvas-replaced', ({ canvas }) => { pageCanvas = canvas; attachClickHandlers(); });
   renderer.on('ready',     () => { renderStaticUI(); });
-  renderer.on('resuming',  () => { /* worker restarting — ready fires shortly */ });
+  renderer.on('resuming',  () => { /* restarting — ready fires shortly */ });
   renderer.on('suspending', ({ done }) => { stopAnimation(); done(); });
 
-  // Update reference to visible canvas (may differ from original after CRT filter swap)
-  pageCanvas = renderer.getCanvas();
-  attachClickHandlers();
+  pageCanvas.addEventListener('click', handleCanvasClick);
+  pageCanvas.addEventListener('mousemove', handleCanvasMouseMove);
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {

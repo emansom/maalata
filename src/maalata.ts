@@ -5,9 +5,9 @@
  * canvas-ultrafast's WebGL Canvas 2D renderer with:
  * - NEAREST texture filtering + CSS image-rendering: pixelated (no smoothing)
  * - 4-stage click-to-photon latency pipeline (168ms worst-case)
- * - Pixel art smoothing (ScaleFX + sharpsmoother + AA level2 + EWA smooth)
+ * - Pixel art smoothing (ScaleFX + sharpsmoother + marching squares + EWA smooth)
  * - CRT post-processing shader (barrel distortion, scanlines, etc.)
- * - 60s idle shutdown with transparent restart
+ * - 60s idle shutdown with transparent restart (when CRT is disabled)
  *
  * Renderer stack priority: BFI > CRT > Smoothing > Passthrough.
  * Exactly one requestAnimationFrame loop runs at any given time.
@@ -39,9 +39,7 @@ export interface RendererConfig {
 export type RendererEvent =
   | { type: 'ready' }
   | { type: 'resuming' }
-  | { type: 'canvas-replaced'; canvas: HTMLCanvasElement }
-  | { type: 'suspending'; done: () => void }
-  | { type: 'canvas-replacing'; done: () => void };
+  | { type: 'suspending'; done: () => void };
 
 /**
  * Display state machine — governs RAF ownership and display mode.
@@ -84,10 +82,20 @@ export class CanvasRenderer {
   };
 
   private _boundVisibilityHandler = (): void => {
-    if (document.visibilityState !== 'visible' || this._lastBatch.length === 0) return;
-    this._ensureActive();
-    this._resetIdleTimer();
-    this._renderer.submitBatch(this._lastBatch);
+    if (this._crtEnabled) {
+      // CRT: stop on hidden, restart on visible (like a real display)
+      if (document.visibilityState === 'hidden') {
+        this._crtVisibilitySuspend();
+      } else {
+        this._crtVisibilityResume();
+      }
+    } else {
+      // Non-CRT: replay last batch on visibility restore
+      if (document.visibilityState !== 'visible' || this._lastBatch.length === 0) return;
+      this._ensureActive();
+      this._resetIdleTimer();
+      this._renderer.submitBatch(this._lastBatch);
+    }
   };
 
   constructor(config: RendererConfig) {
@@ -398,6 +406,8 @@ export class CanvasRenderer {
 
   private _resetIdleTimer(): void {
     this._cancelIdleTimer();
+    // CRT emulates a real display — always on, no idle timeout
+    if (this._crtEnabled) return;
     this._idleTimer = window.setTimeout(() => {
       this._suspend();
     }, this._IDLE_TIMEOUT_MS);
@@ -417,19 +427,29 @@ export class CanvasRenderer {
     this._transitionTo('suspended');
   }
 
+  /** Stop CRT RAF loop on tab hidden (no state change, no events). */
+  private _crtVisibilitySuspend(): void {
+    if (this._displayState === 'crt+smoothing' || this._displayState === 'crt-only') {
+      this._crtDisplay!.stop();
+    }
+  }
+
+  /** Restart CRT RAF loop on tab visible. */
+  private _crtVisibilityResume(): void {
+    if (this._displayState === 'crt+smoothing' || this._displayState === 'crt-only') {
+      this._crtDisplay!.start();
+    }
+  }
+
   private _ensureActive(): void {
     if (this._displayState !== 'suspended') return;
 
     this._dispatchEvent({ type: 'resuming' });
 
-    // Backward-compatible no-op events
-    this._dispatchEvent({ type: 'canvas-replacing', done: () => {} } as RendererEvent);
-
     this._transitionTo(this._deriveMode());
     this._resetIdleTimer();
 
     this._dispatchEvent({ type: 'ready' });
-    this._dispatchEvent({ type: 'canvas-replaced', canvas: this.getCanvas() });
   }
 
   // -------------------------------------------------------------------------
@@ -449,16 +469,11 @@ export class CanvasRenderer {
 
     const acks = [...listeners].map(listener =>
       new Promise<void>(resolve => {
-        switch (eventType) {
-          case "canvas-replacing":
-          case "suspending":
-            listener({ type: eventType, done: resolve } as RendererEvent);
-            break;
-          case "canvas-replaced":
-            listener({ type: eventType, canvas: this.getCanvas() } as RendererEvent);
-            break;
-          default:
-            listener({ type: eventType } as RendererEvent);
+        if (eventType === "suspending") {
+          listener({ type: eventType, done: resolve } as RendererEvent);
+        } else {
+          listener({ type: eventType } as RendererEvent);
+          resolve();
         }
       })
     );
