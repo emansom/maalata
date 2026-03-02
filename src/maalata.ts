@@ -1,16 +1,17 @@
 /**
  * Maalata — "2002 era" Retro Canvas Experience
  *
- * Combines canvas-ultrafast's WebGL Canvas 2D renderer with:
+ * Pixel art canvas renderer. Combines canvas-ultrafast's WebGL Canvas 2D
+ * renderer with:
+ * - NEAREST texture filtering + CSS image-rendering: pixelated (no smoothing)
  * - 4-stage click-to-photon latency pipeline (168ms worst-case)
  * - CRT post-processing shader (barrel distortion, scanlines, etc.)
  * - 60s idle shutdown with transparent restart
- *
- * Public API is backward compatible with the monolithic library.
  */
 
 import { UltrafastRenderer, CanvasAPI, parseColor, type CanvasCommand } from 'canvas-ultrafast';
 import { CRTDisplay, type CRTConfig } from './crt-display';
+import { SmoothingDisplay } from './smoothing-display';
 import { USBPolling, OSKernelProcessing, ApplicationFrame, LCDPanel } from './pipeline';
 
 export { CanvasAPI } from 'canvas-ultrafast';
@@ -22,6 +23,8 @@ export interface RendererConfig {
   crt?: boolean;
   /** CRT filter parameters. Only used when crt is enabled. */
   crtConfig?: Partial<CRTConfig>;
+  /** Enable pixel art smoothing when CRT is disabled. Default: false */
+  smoothing?: boolean;
   /** Explicit background color (CSS string). If omitted, auto-detected from DOM. */
   backgroundColor?: string;
 }
@@ -39,6 +42,7 @@ export class CanvasRenderer {
   private _canvas: HTMLCanvasElement;
   private _renderer: UltrafastRenderer;
   private _crtDisplay: CRTDisplay | null = null;
+  private _smoothingDisplay: SmoothingDisplay | null = null;
   private _crtEnabled: boolean;
   private _canvasAPI: CanvasAPI;
   private _eventListeners: Map<string, Set<(event: RendererEvent) => void>> = new Map();
@@ -74,6 +78,9 @@ export class CanvasRenderer {
     // Create UltrafastRenderer on the user's canvas
     this._renderer = new UltrafastRenderer(this._canvas);
 
+    // Pixel-perfect browser compositing — prevent subpixel smoothing on CSS-scaled canvas
+    this._canvas.style.imageRendering = 'pixelated';
+
     // Immediately stop the passthrough display — we control the display loop
     this._renderer.stopDisplay();
 
@@ -86,7 +93,7 @@ export class CanvasRenderer {
       this._renderer.setBackgroundColor(c[0], c[1], c[2]);
     }
 
-    // Set up CRT or passthrough display
+    // Set up CRT, smoothing, or passthrough display
     if (this._crtEnabled) {
       const [bgR, bgG, bgB] = this._renderer.getBackgroundColor();
       this._crtDisplay = new CRTDisplay(
@@ -98,8 +105,16 @@ export class CanvasRenderer {
       );
       this._crtDisplay.setBgColor(bgR, bgG, bgB);
       this._crtDisplay.start();
+    } else if (config.smoothing) {
+      this._smoothingDisplay = new SmoothingDisplay(
+        this._renderer.getGL(),
+        this._canvas,
+        () => this._renderer.getReadyTexture(),
+        () => this._hasContent,
+      );
+      this._smoothingDisplay.start();
     } else {
-      // No CRT — restart the passthrough display
+      // No CRT, no smoothing — restart the passthrough display
       this._renderer.startDisplay();
     }
 
@@ -110,7 +125,8 @@ export class CanvasRenderer {
     this._attachActivityListeners(this._canvas);
     document.addEventListener('visibilitychange', this._boundVisibilityHandler);
 
-    // No async init needed — WebGL context is ready synchronously.
+    // xBR smoothing is purely algorithmic — no async loading needed.
+    // ready() resolves immediately (backwards-compatible for consumers that await it).
     this._initPromise = Promise.resolve();
     this._resetIdleTimer();
 
@@ -162,11 +178,27 @@ export class CanvasRenderer {
     if (this._crtDisplay) this._crtDisplay.setBgColor(c[0], c[1], c[2]);
   }
 
+  /**
+   * Capture the 2W×2H xBRZ Freescale upscaled texture (before RGSS downsample)
+   * as an ImageBitmap. Returns null if no smoothing/CRT display is active.
+   */
+  public async screenshotUpscaled(): Promise<ImageBitmap | null> {
+    if (this._smoothingDisplay) return this._smoothingDisplay.screenshotUpscaled();
+    if (this._crtDisplay) return this._crtDisplay.screenshotUpscaled();
+    return null;
+  }
+
   public screenshot(): Promise<ImageBitmap> {
-    // Trigger a synchronous CRT render so the canvas has the latest frame
+    // Trigger a synchronous render so the canvas has the latest frame
     if (this._crtDisplay) {
       this._crtDisplay.render();
+    } else if (this._smoothingDisplay) {
+      this._smoothingDisplay.render();
     }
+    // Ensure all GL commands complete before reading the canvas buffer.
+    // Required for CPU-based GL implementations (e.g. SwiftShader in headless
+    // Chromium) where drawArrays may not finish before createImageBitmap.
+    this._renderer.getGL().finish();
     return createImageBitmap(this._canvas);
   }
 
@@ -182,6 +214,10 @@ export class CanvasRenderer {
     if (this._crtDisplay) {
       this._crtDisplay.destroy();
       this._crtDisplay = null;
+    }
+    if (this._smoothingDisplay) {
+      this._smoothingDisplay.destroy();
+      this._smoothingDisplay = null;
     }
     this._renderer.destroy();
     this._state = 'suspended';
@@ -256,6 +292,8 @@ export class CanvasRenderer {
     await this._dispatchAwaited('suspending');
     if (this._crtDisplay) {
       this._crtDisplay.stop();
+    } else if (this._smoothingDisplay) {
+      this._smoothingDisplay.stop();
     } else {
       this._renderer.stopDisplay();
     }
@@ -274,6 +312,8 @@ export class CanvasRenderer {
 
       if (this._crtDisplay) {
         this._crtDisplay.start();
+      } else if (this._smoothingDisplay) {
+        this._smoothingDisplay.start();
       } else {
         this._renderer.startDisplay();
       }

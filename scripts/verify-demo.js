@@ -144,17 +144,18 @@ async function sampleRegionColor(page, x, y, w, h) {
 }
 
 /**
- * Apply CRT config and render test pattern, then wait for pipeline settle.
+ * Apply CRT config and force a synchronous render via screenshot().
+ * The test pattern is already on the ready texture from the "Test Pattern"
+ * button click — we only change config and force-render. This avoids
+ * pipeline timing uncertainty in headless SwiftShader.
  */
-async function applyConfigAndRender(page, config) {
+async function applyConfig(page, config) {
   /* eslint-disable no-undef -- callback runs inside Playwright browser context */
-  await page.evaluate((cfg) => {
+  await page.evaluate(async (cfg) => {
     window.maalataRenderer.updateCRTConfig(cfg);
-    window.maalataRenderTestPattern();
+    await window.maalataRenderer.screenshot();
   }, config);
   /* eslint-enable no-undef */
-  // Wait for pipeline settle (4-stage latency pipeline ~168ms + CRT render)
-  await page.waitForTimeout(500);
 }
 
 function spawnServer(distDir, port) {
@@ -353,6 +354,9 @@ async function main() {
       }
     }
 
+    // Keep renderer alive — hover resets the 60s idle timer
+    await canvas.hover({ position: { x: 400, y: 200 } });
+
     // E2E: Grayscale monotonicity
     console.log(`\n${tag} E2E: Grayscale monotonicity...`);
     {
@@ -372,6 +376,9 @@ async function main() {
       }
       if (monoOk) console.log(`${tag}   Grayscale monotonicity OK`);
     }
+
+    // Keep renderer alive — hover resets the 60s idle timer
+    await canvas.hover({ position: { x: 400, y: 200 } });
 
     // E2E: Gamma curve (default config, wider tolerance)
     console.log(`\n${tag} E2E: Gamma curve (default config)...`);
@@ -409,11 +416,15 @@ async function main() {
       }
     }
 
+    // Keep renderer alive — hover resets the 60s idle timer
+    await canvas.hover({ position: { x: 400, y: 200 } });
+
     // --- Unit test: Passthrough (neutral config) ---
+    // Test pattern is already on the ready texture from "Test Pattern" button.
+    // Switch to neutral config and verify white bar ≈ 255.
     console.log(`\n${tag} Unit: Passthrough (neutral config)...`);
     {
-      await applyConfigAndRender(page, NEUTRAL_CRT);
-      // Sample white bar (first SMPTE bar)
+      await applyConfig(page, NEUTRAL_CRT);
       const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
       console.log(`${tag}   White bar: R=${color.r.toFixed(0)} G=${color.g.toFixed(0)} B=${color.b.toFixed(0)} (expected ≈ 255 ±15)`);
       const avg = (color.r + color.g + color.b) / 3;
@@ -427,7 +438,7 @@ async function main() {
     // --- Unit test: CRT gamma (BT.1886) ---
     console.log(`\n${tag} Unit: CRT gamma (crtGamma=2.4)...`);
     {
-      await applyConfigAndRender(page, { ...NEUTRAL_CRT, crtGamma: 2.4 });
+      await applyConfig(page, { ...NEUTRAL_CRT, crtGamma: 2.4 });
       const logInputs = [];
       const logOutputs = [];
       for (let i = 2; i <= 13; i++) {
@@ -464,7 +475,7 @@ async function main() {
     console.log(`\n${tag} Unit: Pixel beam darkening...`);
     {
       // Enable beam (default canvas size) with CRT gamma 2.4/2.2
-      await applyConfigAndRender(page, { ...NEUTRAL_CRT, crtGamma: 2.4, _inputSize: null });
+      await applyConfig(page, { ...NEUTRAL_CRT, crtGamma: 2.4, _inputSize: null });
       // Sample white bar — beam Gaussian profile darkens averaged pixels
       const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
       const avg = (color.r + color.g + color.b) / 3;
@@ -482,7 +493,7 @@ async function main() {
     // --- Unit test: Brightness ---
     console.log(`\n${tag} Unit: Brightness (0.5)...`);
     {
-      await applyConfigAndRender(page, { ...NEUTRAL_CRT, brightness: 0.5 });
+      await applyConfig(page, { ...NEUTRAL_CRT, brightness: 0.5 });
       const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
       const avg = (color.r + color.g + color.b) / 3;
       console.log(`${tag}   White bar avg: ${avg.toFixed(0)} (expected ≈ 128 ±15)`);
@@ -496,7 +507,7 @@ async function main() {
     // --- Unit test: Contrast ---
     console.log(`\n${tag} Unit: Contrast (2.0)...`);
     {
-      await applyConfigAndRender(page, { ...NEUTRAL_CRT, contrast: 2.0 });
+      await applyConfig(page, { ...NEUTRAL_CRT, contrast: 2.0 });
       // Sample 75% gray step (step index 11, input ≈ 187)
       const sx = RAMP_X + 11 * STEP_W;
       const color = await sampleRegionColor(page, sx, RAMP_Y, STEP_W, RAMP_H);
@@ -514,7 +525,7 @@ async function main() {
     // --- Unit test: Desaturation ---
     console.log(`\n${tag} Unit: Desaturation (0.5)...`);
     {
-      await applyConfigAndRender(page, { ...NEUTRAL_CRT, desaturation: 0.5 });
+      await applyConfig(page, { ...NEUTRAL_CRT, desaturation: 0.5 });
       // Sample red bar (6th color patch: pure R at patchX + 0*patchWidth)
       // Actually the 5th SMPTE bar is red (index 5): bars[5] = [255, 0, 0]
       const redBarX = BARS_X + 5 * BAR_W;
@@ -528,17 +539,157 @@ async function main() {
       }
     }
 
-    // Restore default config and leave demo in clean state
+    // Restore default config
     console.log(`\n${tag} Restoring default CRT config...`);
-    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
-    await page.evaluate(() => {
-      window.maalataRenderer.updateCRTConfig({});
-      window.maalataRenderTestPattern();
-    });
-    /* eslint-enable no-undef */
-    await page.waitForTimeout(500);
+    await applyConfig(page, {});
 
     await page.close();
+
+    // -----------------------------------------------------------------
+    // Smoothing demo tests
+    // -----------------------------------------------------------------
+
+    const smoothingUrl = `${appUrl}/smoothing.html`;
+    console.log(`\n${tag} Navigating to ${smoothingUrl}...`);
+
+    const smoothPage = await browser.newPage();
+
+    // Wire up error collectors for smoothing page
+    smoothPage.on('pageerror', err => {
+      const msg = `[smoothing JS Exception] ${err.message}`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    });
+
+    smoothPage.on('console', msg => {
+      const type = msg.type();
+      if (type === 'error' || type === 'warning') {
+        const text = msg.text();
+        // Ignore willReadFrequently hints — browser perf advisory, not an error
+        if (text.includes('willReadFrequently')) return;
+        const formatted = `[smoothing console.${type}] ${text}`;
+        errors.push(formatted);
+        console.warn(`${tag} ${formatted}`);
+      }
+    });
+
+    smoothPage.on('requestfailed', req => {
+      const url = req.url();
+      if (url.startsWith('data:') || url.startsWith('chrome-extension:')) return;
+      const reason = req.failure()?.errorText ?? 'unknown';
+      const msg = `[smoothing requestfailed] ${url} — ${reason}`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    });
+
+    await smoothPage.goto(smoothingUrl, { waitUntil: 'load' });
+    await smoothPage.waitForTimeout(DEMO.settleMs);
+    console.log(`${tag} Smoothing page settled\n`);
+
+    // Verify both canvases have visible content (avatar rendered at 1:1)
+    console.log(`${tag} Smoothing: content verification via screenshots...`);
+
+    /**
+     * Count unique RGB colors in the central region of a canvas screenshot.
+     * The avatar is drawn at 1:1 centered on a canvas — the central region
+     * crosses avatar body edges where smoothing creates intermediate blend
+     * values. canvasSize is the logical canvas size (e.g. 400 or 800).
+     */
+    async function sampleUniqueColors(locator, canvasSize = 400) {
+      const screenshotBuffer = await locator.screenshot({ type: 'png' });
+      const base64 = screenshotBuffer.toString('base64');
+
+      /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+      return smoothPage.evaluate(async ({ b64, logicalSize }) => {
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = `data:image/png;base64,${b64}`;
+        });
+        const tmp = document.createElement('canvas');
+        tmp.width = img.width;
+        tmp.height = img.height;
+        const ctx = tmp.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+
+        // Scale factor: screenshot may differ from canvas buffer size
+        const scaleX = img.width / logicalSize;
+        const scaleY = img.height / logicalSize;
+
+        // Sample central strip across the canvas (crosses avatar body edges)
+        const stripY = Math.round((logicalSize / 2) * scaleY);
+        const stripStartX = Math.round((logicalSize * 0.25) * scaleX);
+        const stripEndX = Math.round((logicalSize * 0.75) * scaleX);
+        const colors = new Set();
+
+        for (let x = stripStartX; x < stripEndX; x++) {
+          const { data } = ctx.getImageData(x, stripY, 1, 1);
+          colors.add(`${data[0]},${data[1]},${data[2]}`);
+        }
+
+        // Also check that the canvas has non-trivial content (not all black)
+        const fullData = ctx.getImageData(0, 0, img.width, img.height).data;
+        let nonBlack = 0;
+        for (let i = 0; i < fullData.length; i += 4) {
+          if (fullData[i] > 10 || fullData[i + 1] > 10 || fullData[i + 2] > 10) nonBlack++;
+        }
+        const contentRatio = nonBlack / (img.width * img.height);
+
+        return { uniqueColors: colors.size, contentRatio };
+      }, { b64: base64, logicalSize: canvasSize });
+      /* eslint-enable no-undef */
+    }
+
+    const rawResult = await sampleUniqueColors(smoothPage.locator('#canvas-raw'));
+    const smoothResult = await sampleUniqueColors(smoothPage.locator('#canvas-smooth'));
+
+    console.log(`${tag}   Raw: ${rawResult.uniqueColors} unique colors, ${(rawResult.contentRatio * 100).toFixed(1)}% content`);
+    console.log(`${tag}   Smooth: ${smoothResult.uniqueColors} unique colors, ${(smoothResult.contentRatio * 100).toFixed(1)}% content`);
+
+    // Both canvases must have visible content
+    if (rawResult.contentRatio < 0.05) {
+      const msg = `[smoothing] Raw canvas has too little content: ${(rawResult.contentRatio * 100).toFixed(1)}% non-black`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    }
+    if (smoothResult.contentRatio < 0.05) {
+      const msg = `[smoothing] Smoothed canvas has too little content: ${(smoothResult.contentRatio * 100).toFixed(1)}% non-black`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    }
+
+    // Smoothed canvas should have more unique colors than raw
+    // (hq4x creates intermediate blend values at pixel art edges)
+    if (smoothResult.uniqueColors > rawResult.uniqueColors) {
+      console.log(`${tag}   Smoothing produces anti-aliased edges (${smoothResult.uniqueColors} > ${rawResult.uniqueColors} unique colors)`);
+    } else {
+      const msg = `[smoothing] Smoothed canvas should have more unique colors than raw (${smoothResult.uniqueColors} <= ${rawResult.uniqueColors})`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    }
+
+    // xBRZ-only canvas (800×800, 2× upscale without RGSS downsample)
+    // Wait for the setTimeout in smoothing.ts to capture the xBRZ output
+    await smoothPage.waitForTimeout(500);
+
+    const xbrzResult = await sampleUniqueColors(smoothPage.locator('#canvas-xbrz'), 800);
+    console.log(`${tag}   xBRZ: ${xbrzResult.uniqueColors} unique colors, ${(xbrzResult.contentRatio * 100).toFixed(1)}% content`);
+
+    if (xbrzResult.contentRatio < 0.05) {
+      const msg = `[smoothing] xBRZ canvas has too little content: ${(xbrzResult.contentRatio * 100).toFixed(1)}% non-black`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    }
+    if (xbrzResult.uniqueColors <= rawResult.uniqueColors) {
+      const msg = `[smoothing] xBRZ canvas should have more unique colors than raw (${xbrzResult.uniqueColors} <= ${rawResult.uniqueColors})`;
+      errors.push(msg);
+      console.error(`${tag} ${msg}`);
+    }
+
+    console.log(`${tag} Smoothing content verification complete`);
+
+    await smoothPage.close();
 
   } finally {
     if (serverProc) { serverProc.kill('SIGTERM'); await sleep(300); }

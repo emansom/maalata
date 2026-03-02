@@ -47,46 +47,58 @@ Four discrete stages model the full path from input device to screen, each with 
 
 Worst-case: **168ms** (8 + 10 + 125 + 25). Average: **~119ms**. GPU queuing latency is handled by canvas-ultrafast's real WebGL triple-buffer FBOs rather than a simulated delay stage.
 
-### Pixel art smoothing (4x Kopf-Lischinski + RGSS)
+### Pixel art smoothing (xBRZ Freescale + RGSS)
 
-A three-pass pre-processing pipeline smooths pixel art before CRT effects are applied. The source image is first upscaled 4× (2× per dimension) via nearest-neighbor, then Kopf-Lischinski smoothing runs at 4× resolution for higher edge precision, and finally RGSS (Rotated Grid SuperSampling) downsamples back to native resolution. Same output resolution as input, vastly better edge quality.
+maalata targets 1:1 pixel art — consumers draw at native resolution and get improved visuals automatically, no code changes needed. The library handles all internal upscaling and smoothing transparently.
+
+**Pixel-perfect rendering** — maalata is designed for pixel art canvases. All WebGL textures use `gl.NEAREST` (nearest-neighbor) filtering and the canvas element uses CSS `image-rendering: pixelated`. Together with canvas-ultrafast's `imageSmoothingEnabled: false` default, this eliminates bilinear interpolation at every stage — from WebGL texture sampling through browser compositing.
+
+A three-pass pre-processing pipeline smooths pixel art edges using xBRZ Freescale Multipass (Hyllian + Zenju), a perceptual color distance algorithm with dominant gradient detection that produces the smoothest possible edges for pixel art. Pass 0 analyzes a 3×3+extended neighborhood and outputs packed blend metadata; pass 1 reads those decisions and applies smoothstep-based directional blending at 2× scale; RGSS downsamples back to native resolution. Same output resolution as input, vastly better edge quality. Purely algorithmic — no lookup tables or async loading needed.
+
+The smoothing pipeline is implemented as a standalone `SmoothingDisplay` class that can be used in two modes:
+- **With CRT** (`crt: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-2, then applies CRT effects on the smoothed output.
+- **Standalone** (`crt: false, smoothing: true`): `SmoothingDisplay` runs its own RAF loop and blits smoothed output directly to screen — pixel art edge smoothing without the retro CRT look.
 
 On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pipeline corrects.
-
-The smoothing shader adapts the Kopf-Lischinski depixelization algorithm (SIGGRAPH 2011) for real-time per-fragment WebGL2 rendering, following the GPU architecture of Silva et al. (SIBGRAPI 2013). The full Kopf-Lischinski pipeline requires sequential polygon extraction; this shader extracts the per-pixel-parallel stages and replaces polygon extraction with direct per-fragment color interpolation.
 
 ```
 Ready Texture (raw pixel art, sRGB, W × H)
     |
-[Pass 1: Nearest-neighbor 4x upscale]
-    |  GPU blit: (W×H) → (2W×2H), each source texel becomes 2×2
+[Pass 0: xBRZ analysis]
+    |  3×3 core + extended neighbors, YCbCr perceptual color distance
+    |  4-corner blend classification (NONE/NORMAL/DOMINANT)
+    |  Shallow/steep line detection, packed as integer metadata (W×H → W×H)
     |
-4x Upscaled Texture (2W × 2H)
+Analysis Texture (blend metadata, W × H)
     |
-[Pass 2: Kopf-Lischinski smoothing at 4x]
-    |  Block detection, YUV similarity graph, diagonal crossing
-    |  resolution, edge-aware interpolation — with 4× spatial precision
+[Pass 1: xBRZ freescale blend]
+    |  Reads pass0 metadata + original source
+    |  Decodes blend flags, applies directional smoothstep blending
+    |  per corner with shallow/steep line awareness (W×H → 2W×2H)
     |
-Smoothed 4x Texture (2W × 2H)
+Upscaled Texture (2W × 2H)
     |
-[Pass 3: RGSS 4x downsample]
-    |  4 rotated grid samples per output pixel — anti-aliased reduction
+[Pass 2: RGSS downsample]
+    |  4 rotated grid samples per output pixel (2W×2H → W×H)
     |
 Smoothed Texture (anti-aliased edges, sRGB, W × H)
     |
-[Pass 4: CRT shader -> Screen]
+[Pass 3: CRT shader -> Screen]
 ```
 
-The RGSS downsample uses the same rotated grid pattern as hardware 4× MSAA, with sample offsets at (-3/8,-1/8), (1/8,-3/8), (3/8,1/8), (-1/8,3/8) in output pixel units. This avoids the axis-aligned artifacts of a regular box filter.
+Total VRAM for the smoothing pipeline is 6 WH (analysis W×H + upscaled 2W×2H + intermediate W×H).
 
-Algorithm stages per fragment (Kopf-Lischinski pass):
-1. **Block detection** — search up to 8 texels per direction for uniform-color boundaries to find the logical pixel this canvas texel belongs to (after 4x upscale, original 1-pixel sprites are 2×2 blocks)
-2. **3x3 logical neighborhood** — sample 8 adjacent logical pixels by jumping one texel beyond each detected block boundary
-3. **YUV similarity graph** — compare all neighbor pairs using perceptually-weighted YUV color space (thresholds: Y<=48, U<=7, V<=6 on 0-255 scale)
-4. **Diagonal crossing resolution** — when two diagonals cross at a corner, resolve ambiguity using the valence heuristic (keep sparser diagonal, matching Kopf-Lischinski)
-5. **Edge-aware interpolation** — at block boundaries blend toward connected neighbors; at corners with resolved diagonals apply diagonal cell boundary cut via signed distance function
+The RGSS stage uses the same rotated grid pattern as hardware 4× MSAA, with sample offsets at (-3/8,-1/8), (1/8,-3/8), (3/8,1/8), (-1/8,3/8) in output pixel units. This avoids the axis-aligned artifacts of a regular box filter.
 
-Early-outs for non-pixel-art content: 1x1 blocks (text, gradients) and interior pixels (far from block edges) pass through unchanged. Bypassed entirely when `_inputSize: [0, 0]` (test mode, skips all three pre-processing passes).
+Algorithm stages per fragment (xBRZ analysis pass):
+1. **3×3+extended neighborhood sampling** — read core pixels A-I plus extended neighbors up to ±2 offset for each corner
+2. **YCbCr perceptual distance** — `DistYCbCr()` with Rec.2020 luma weights (0.2627, 0.6780, 0.0593), Cb/Cr chroma components
+3. **4-corner blend classification** — for each corner: compare diagonal gradient strengths, classify as BLEND_NONE, BLEND_NORMAL, or BLEND_DOMINANT
+4. **Line blend refinement** — check adjacent corner conflicts, detect smooth runs (G→H→I→F→C), determine if line blending is appropriate
+5. **Shallow/steep line detection** — compare perpendicular gradient strengths against `STEEP_DIRECTION_THRESHOLD` (2.2) to classify diagonal line angles
+6. **Metadata packing** — encode `blendResult + 4*doLineBlend + 16*shallowLine + 64*steepLine` per channel, divide by 255.0 for RGBA8 storage
+
+Pass 1 operates at 2× output resolution. For each output fragment: decode packed metadata from pass 0, read 5 original pixels (B, D, E, F, H), then for each active corner compute `get_left_ratio()` — the signed distance from the sub-pixel position to the directional blend line, smoothed through `smoothstep(-√2/2, √2/2, v)`. The blend pixel is chosen as the perceptually-closer neighbor (via `DistYCbCr`). Shallow/steep flags adjust the blend line origin and direction for better diagonal handling.
 
 ### CRT post-processing
 
@@ -118,6 +130,7 @@ Every effect block is guarded by a `> 0.0001` threshold check for early-out when
 ```ts
 import { CanvasRenderer } from 'maalata';
 
+// Full CRT experience (smoothing included automatically)
 const renderer = new CanvasRenderer({
   canvas: document.getElementById('canvas') as HTMLCanvasElement,
   crt: true,
@@ -125,6 +138,13 @@ const renderer = new CanvasRenderer({
     chromaticAberration: 0.0005,
     flicker: 0.02,
   },
+});
+
+// Smoothing only (no CRT effects) — pixel art edge smoothing without retro look
+const smoothRenderer = new CanvasRenderer({
+  canvas: document.getElementById('canvas') as HTMLCanvasElement,
+  crt: false,
+  smoothing: true,
 });
 
 // Canvas 2D-compatible drawing API (provided by canvas-ultrafast)
@@ -152,7 +172,7 @@ renderer.destroy();
 | `CanvasRenderer` | Latency pipeline + CRT display + idle lifecycle |
 | `CanvasAPI` | Canvas 2D-compatible command recording (re-exported from canvas-ultrafast) |
 | `CRTConfig` | All CRT shader parameters (barrel, pixel beam, BFI, etc.) |
-| `RendererConfig` | Constructor options (canvas, crt toggle, CRT config) |
+| `RendererConfig` | Constructor options (canvas, crt toggle, smoothing toggle, CRT config) |
 | `RendererEvent` | Union type for lifecycle events |
 
 ### CanvasRenderer methods
@@ -164,6 +184,7 @@ renderer.destroy();
 | `getCanvasSize()` | Return `{ width, height }` |
 | `on(event, callback)` | Subscribe to lifecycle events; returns unsubscribe function |
 | `screenshot()` | Capture current CRT-processed frame as `ImageBitmap` |
+| `screenshotUpscaled()` | Capture xBRZ 2× upscaled texture (before RGSS) as `ImageBitmap`, or `null` |
 | `ready()` | `Promise<void>` that resolves when the renderer is initialized |
 | `destroy()` | Release all WebGL resources and detach listeners |
 
@@ -194,10 +215,9 @@ The combined fragment shader draws from three MIT-licensed implementations:
 
 ### Pixel art smoothing
 
-- **Kopf & Lischinski**, ["Depixelizing Pixel Art"](https://johanneskopf.de/publications/pixelart/) (SIGGRAPH 2011) — Original algorithm: similarity graph, diagonal crossing resolution via valence heuristic
-- **Silva et al.**, ["Real Time Pixel Art Remasterization on GPUs"](http://sibgrapi.sid.inpe.br/col/sid.inpe.br/sibgrapi/2013/07.11.18.13/doc/real_time_pixel_art_remasterization_on_GPUs_114688_camera_ready.pdf) (SIBGRAPI 2013) — GPU-parallel architecture for per-pixel stages
-- **[swielgus/vctrsKL](https://github.com/swielgus/vctrsKL)** (CUDA) — YUV similarity thresholds, graph construction reference
-- **[marcoc2/pixel-art-remaster-gpu](https://github.com/marcoc2/pixel-art-remaster-gpu)** (CUDA) — Per-pixel parallel architecture reference
+- **Hyllian** (2011/2016) — xBR-vertex code and texel mapping (MIT)
+- **Zenju** — xBRZ algorithm concepts from HqMAME/Desmume (GPL-3.0): YCbCr perceptual distance, dominant gradient detection, shallow/steep line classification
+- **[libretro/glsl-shaders](https://github.com/libretro/glsl-shaders/tree/master/xbrz/shaders/xbrz-freescale-multipass)** (MIT + GPL-3.0) — GLSL reference implementation of xBRZ Freescale Multipass (pass0 analysis + pass1 blend) adapted for the maalata smoothing pipeline
 
 ### Rendering backend
 

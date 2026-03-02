@@ -1,290 +1,396 @@
 /**
- * Pixel Art Smoothing GLSL Shader (Kopf-Lischinski)
+ * xBRZ Freescale Multipass Pixel Art Smoothing GLSL ES 3.00 Shaders
  *
- * Pre-processing pass that smooths pixel art before CRT effects are applied.
- * Operates on a 4x nearest-neighbor upscaled texture (2x per dimension) where
- * each original source pixel is a 2×2 block. This 4x context gives the
- * interpolation 4× the spatial precision of running at native resolution.
+ * Two-pass edge-aware pixel art scaler using YCbCr perceptual color distance
+ * with dominant gradient detection, shallow/steep line classification, and
+ * smoothstep-based sub-pixel blending at arbitrary scale factors.
+ *
+ * Pass 0 (analysis): Reads source at W×H, outputs packed blend metadata at W×H.
+ *   3×3 core + extended neighbors (up to ±2 offset), DistYCbCr perceptual
+ *   color distance (Rec.2020 luma weights), 4-corner blend classification
+ *   (NONE/NORMAL/DOMINANT), shallow/steep line detection, doLineBlend flags.
+ *   All packed as integers (blendResult + 4*doLineBlend + 16*shallow + 64*steep)
+ *   then divided by 255.0 for RGBA8 storage (max value 86/255 ≈ 0.337).
+ *
+ * Pass 1 (freescale blend): Reads pass0 metadata + original source at 2W×2H.
+ *   Decodes packed blend flags, for each active corner applies directional
+ *   smoothstep blending via get_left_ratio() — signed distance from sub-pixel
+ *   position to blend line with smoothstep(-√2/2, √2/2, v). Blends toward the
+ *   perceptually-closer neighbor. "Freescale" = works at any scale factor.
+ *
+ * Both passes use CRT_VERTEX_SRC as vertex shader (no custom vertex shader
+ * needed — analysis computes offsets per-fragment via texelSize * vec2(x, y)).
  *
  * Data flow:
- *   Ready texture (W×H) → 4x nearest-neighbor upscale (2W×2H) →
- *   [this shader at 2W×2H] → RGSS 4x downsample (W×H) → CRT shader
+ *   Ready texture (W × H) → [pass0 analysis] → Metadata texture (W × H) →
+ *   [pass1 freescale blend with original source] → Upscaled texture (2W × 2H) →
+ *   [RGSS downsample] → Smoothed texture (W × H) → CRT shader
  *
- * The full Kopf-Lischinski pipeline (graph -> polygons -> splines -> SVG)
- * requires sequential processing for polygon extraction. This shader
- * extracts the per-pixel-parallel stages (edge detection, diagonal
- * resolution) and replaces polygon extraction with direct per-fragment
- * color interpolation, achieving the visual quality of correct diagonal
- * resolution without the sequential vectorization.
+ * Adapted from libretro/glsl-shaders xbrz-freescale-multipass:
+ *   https://github.com/libretro/glsl-shaders/tree/master/xbrz/shaders/xbrz-freescale-multipass
  *
- * Algorithm stages per fragment:
- *  1. Block detection — search for uniform-color boundaries (up to 8 texels
- *     per direction) to find the logical pixel this canvas texel belongs to.
- *     After 4x upscale, original 1-pixel sprites become 2×2 blocks, original
- *     2×2 become 4×4, etc.
- *  2. 3x3 logical neighborhood — sample 8 adjacent logical pixels by jumping
- *     one texel beyond each detected block boundary
- *  3. YUV similarity graph — compare all neighbor pairs using perceptually-
- *     weighted YUV color space (thresholds: Y<=48, U<=7, V<=6 on 0-255)
- *  4. Diagonal crossing resolution — when two diagonals cross at a corner,
- *     resolve ambiguity using valence heuristic (keep sparser diagonal)
- *  5. Edge-aware interpolation — at block boundaries blend toward connected
- *     neighbors; at corners with resolved diagonals apply diagonal cell
- *     boundary cut via signed distance function
+ * Hyllian's xBR-vertex code and texel mapping — Copyright (C) 2011/2016 Hyllian (MIT)
+ * xBRZ concepts from Desmume/HqMAME — Copyright (C) Zenju (GPL-3.0)
  *
- * Smoothstep threshold (0.3, 1.0): tuned for the 4x operating context.
- * After upscale, 2×2 blocks have edgeX max = 0.5 (both texels at edge).
- * The 0.3 start produces gentle blending (bx≈0.21) for 2×2 blocks, strong
- * blending (bx≈0.65) for 4×4, and near-full (bx≈0.88) for 8×8.
- *
- * Early-outs:
- *  - u_inputSize.y < 0.5: bypass (test mode, same as CRT beam bypass)
- *  - 1x1 blocks: non-pixel-art content (text, gradients), pass through
- *  - Interior pixels (>40% from edge): no neighbors needed, pass through
- *
- * References:
- *  - Kopf & Lischinski, "Depixelizing Pixel Art" (SIGGRAPH 2011)
- *  - Silva et al., "Real Time Pixel Art Remasterization on GPUs" (SIBGRAPI 2013)
- *  - swielgus/vctrsKL (CUDA) — YUV thresholds, graph construction
- *  - marcoc2/pixel-art-remaster-gpu (CUDA) — per-pixel parallel architecture
+ * Input Pixel Mapping (pass 0):
+ *   -|x|x|x|-
+ *   x|A|B|C|x      blendResult Mapping: x|y|
+ *   x|D|E|F|x                           w|z|
+ *   x|G|H|I|x
+ *   -|x|x|x|-
  */
+
+// ---------------------------------------------------------------------------
+// Pass 0: xBRZ analysis fragment shader (W×H → W×H metadata)
+// ---------------------------------------------------------------------------
 
 /**
- * Fragment shader: Kopf-Lischinski pixel art smoothing.
+ * Fragment shader for pass 0: blend analysis and metadata output.
  *
- * Reuses CRT_VERTEX_SRC from crt-shaders.ts (same fullscreen quad).
+ * Reads a 3×3 core neighborhood (A-I) plus extended neighbors for each corner.
+ * Computes perceptual color distance (YCbCr) to classify each corner's blend
+ * type (NONE/NORMAL/DOMINANT) and detect shallow/steep diagonal lines.
+ *
+ * Output is packed integer metadata / 255.0 stored in RGBA8 texture.
+ * Each channel encodes one corner's blend info.
+ *
+ * Uniforms:
+ *   u_source     — source texture (W × H), texture unit 0
+ *   u_sourceSize — source dimensions (W, H)
  */
-export const SMOOTH_FRAGMENT_SRC = `
-  #ifdef GL_FRAGMENT_PRECISION_HIGH
-    precision highp float;
-  #else
-    precision mediump float;
-  #endif
+export const XBRZ_ANALYSIS_FRAGMENT_SRC = `#version 300 es
+precision highp float;
 
-  varying vec2 v_texCoord;
+in vec2 v_texCoord;
 
-  uniform sampler2D u_texture;
-  uniform vec2 u_inputSize;
+uniform sampler2D u_source;
+uniform vec2 u_sourceSize;
 
-  // --- YUV similarity (Kopf-Lischinski / vctrsKL thresholds) ---
-  vec3 rgb2yuv(vec3 c) {
-    return vec3(
-      0.299 * c.r + 0.587 * c.g + 0.114 * c.b,
-      -0.169 * c.r - 0.331 * c.g + 0.5 * c.b + 0.5,
-      0.5 * c.r - 0.419 * c.g - 0.081 * c.b + 0.5
-    );
+out vec4 fragColor;
+
+#define BLEND_NONE 0
+#define BLEND_NORMAL 1
+#define BLEND_DOMINANT 2
+#define LUMINANCE_WEIGHT 1.0
+#define EQUAL_COLOR_TOLERANCE (30.0 / 255.0)
+#define STEEP_DIRECTION_THRESHOLD 2.2
+#define DOMINANT_DIRECTION_THRESHOLD 3.6
+
+float DistYCbCr(vec3 pixA, vec3 pixB) {
+  const vec3 w = vec3(0.2627, 0.6780, 0.0593);
+  const float scaleB = 0.5 / (1.0 - w.b);
+  const float scaleR = 0.5 / (1.0 - w.r);
+  vec3 diff = pixA - pixB;
+  float Y = dot(diff, w);
+  float Cb = scaleB * (diff.b - Y);
+  float Cr = scaleR * (diff.r - Y);
+  return sqrt(((LUMINANCE_WEIGHT * Y) * (LUMINANCE_WEIGHT * Y)) + (Cb * Cb) + (Cr * Cr));
+}
+
+bool IsPixEqual(vec3 pixA, vec3 pixB) {
+  return (DistYCbCr(pixA, pixB) < EQUAL_COLOR_TOLERANCE);
+}
+
+#define eq(a,b)  (a == b)
+#define neq(a,b) (a != b)
+#define P(x,y) texture(u_source, coord + texelSize * vec2(x, y)).rgb
+
+void main() {
+  // Bypass: test mode
+  if (u_sourceSize.y < 0.5) {
+    fragColor = vec4(0.0);
+    return;
   }
 
-  bool isSimilar(vec3 a, vec3 b) {
-    vec3 d = abs(rgb2yuv(a) - rgb2yuv(b));
-    return d.x <= 48.0/255.0 && d.y <= 7.0/255.0 && d.z <= 6.0/255.0;
+  vec2 texelSize = 1.0 / u_sourceSize;
+  vec2 pos = fract(v_texCoord * u_sourceSize) - vec2(0.5, 0.5);
+  vec2 coord = v_texCoord - pos * texelSize;
+
+  //  Input Pixel Mapping:  -|x|x|x|-
+  //                        x|A|B|C|x
+  //                        x|D|E|F|x
+  //                        x|G|H|I|x
+  //                        -|x|x|x|-
+
+  vec3 A = P(-1.,-1.);
+  vec3 B = P( 0.,-1.);
+  vec3 C = P( 1.,-1.);
+  vec3 D = P(-1., 0.);
+  vec3 E = P( 0., 0.);
+  vec3 F = P( 1., 0.);
+  vec3 G = P(-1., 1.);
+  vec3 H = P( 0., 1.);
+  vec3 I = P( 1., 1.);
+
+  // blendResult Mapping: x|y|
+  //                      w|z|
+  ivec4 blendResult = ivec4(BLEND_NONE);
+
+  // --- Preprocess corners ---
+
+  // Corner z: Pixel Tap Mapping: -|-|-|-|-
+  //                              -|-|B|C|-
+  //                              -|D|E|F|x
+  //                              -|G|H|I|x
+  //                              -|-|x|x|-
+  if (!((eq(E,F) && eq(H,I)) || (eq(E,H) && eq(F,I)))) {
+    float dist_H_F = DistYCbCr(G, E) + DistYCbCr(E, C) + DistYCbCr(P(0.,2.), I) + DistYCbCr(I, P(2.,0.)) + (4.0 * DistYCbCr(H, F));
+    float dist_E_I = DistYCbCr(D, H) + DistYCbCr(H, P(1.,2.)) + DistYCbCr(B, F) + DistYCbCr(F, P(2.,1.)) + (4.0 * DistYCbCr(E, I));
+    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_H_F) < dist_E_I;
+    blendResult.z = ((dist_H_F < dist_E_I) && neq(E,F) && neq(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
   }
 
-  void main() {
-    vec2 uv = v_texCoord;
-    vec2 px = 1.0 / u_inputSize;  // texel size
-    vec3 center = texture2D(u_texture, uv).rgb;
-
-    // --- Bypass: test mode ---
-    if (u_inputSize.y < 0.5) {
-      gl_FragColor = vec4(center, 1.0);
-      return;
-    }
-
-    // --- STEP 1: Block detection ---
-    // Search up to 8 texels in each direction for color boundaries.
-    // A boundary is where the color differs from center.
-    // blockL/R/U/D = distance in texels to nearest boundary in each direction.
-
-    float blockL = 0.0;
-    float blockR = 0.0;
-    float blockU = 0.0;
-    float blockD = 0.0;
-
-    for (int i = 1; i <= 8; i++) {
-      if (blockL == 0.0 && !isSimilar(center, texture2D(u_texture, uv + vec2(-float(i) * px.x, 0.0)).rgb))
-        blockL = float(i);
-      if (blockR == 0.0 && !isSimilar(center, texture2D(u_texture, uv + vec2( float(i) * px.x, 0.0)).rgb))
-        blockR = float(i);
-      if (blockU == 0.0 && !isSimilar(center, texture2D(u_texture, uv + vec2(0.0, -float(i) * px.y)).rgb))
-        blockU = float(i);
-      if (blockD == 0.0 && !isSimilar(center, texture2D(u_texture, uv + vec2(0.0,  float(i) * px.y)).rgb))
-        blockD = float(i);
-    }
-
-    // If no boundary found within 8 texels, clamp to 8 (very large block or edge)
-    if (blockL == 0.0) blockL = 8.0;
-    if (blockR == 0.0) blockR = 8.0;
-    if (blockU == 0.0) blockU = 8.0;
-    if (blockD == 0.0) blockD = 8.0;
-
-    // Block extent: distance from this texel to block boundaries
-    // blockSize = total block width/height in texels
-    float blockW = blockL + blockR - 1.0;
-    float blockH = blockU + blockD - 1.0;
-
-    // Early-out: 1x1 blocks are non-pixel-art content (text, gradients)
-    if (blockW < 1.5 && blockH < 1.5) {
-      gl_FragColor = vec4(center, 1.0);
-      return;
-    }
-
-    // Sub-position within block: [-0.5, 0.5] from block center
-    float subX = (blockL - 0.5 * (blockW + 1.0)) / blockW;
-    float subY = (blockU - 0.5 * (blockH + 1.0)) / blockH;
-
-    // Early-out: interior pixels (far from edges) — no blending needed
-    if (abs(subX) < 0.1 && abs(subY) < 0.1) {
-      gl_FragColor = vec4(center, 1.0);
-      return;
-    }
-
-    // --- STEP 2: Sample 3x3 logical neighborhood ---
-    // Jump one texel beyond each block boundary to sample adjacent logical pixels.
-    vec2 uvL = uv + vec2(-blockL * px.x, 0.0);
-    vec2 uvR = uv + vec2( blockR * px.x, 0.0);
-    vec2 uvU = uv + vec2(0.0, -blockU * px.y);
-    vec2 uvD = uv + vec2(0.0,  blockD * px.y);
-
-    vec3 ml = texture2D(u_texture, uvL).rgb;              // middle-left
-    vec3 mr = texture2D(u_texture, uvR).rgb;              // middle-right
-    vec3 tc = texture2D(u_texture, uvU).rgb;              // top-center
-    vec3 bc = texture2D(u_texture, uvD).rgb;              // bottom-center
-    vec3 tl = texture2D(u_texture, uvU + vec2(-blockL * px.x, 0.0)).rgb;  // top-left
-    vec3 tr = texture2D(u_texture, uvU + vec2( blockR * px.x, 0.0)).rgb;  // top-right
-    vec3 bl = texture2D(u_texture, uvD + vec2(-blockL * px.x, 0.0)).rgb;  // bottom-left
-    vec3 br = texture2D(u_texture, uvD + vec2( blockR * px.x, 0.0)).rgb;  // bottom-right
-
-    // --- STEP 3: YUV similarity graph ---
-    // Cardinal edges: center <-> neighbor
-    bool sim_ml = isSimilar(center, ml);
-    bool sim_mr = isSimilar(center, mr);
-    bool sim_tc = isSimilar(center, tc);
-    bool sim_bc = isSimilar(center, bc);
-
-    // Diagonal edges: center <-> corner
-    bool sim_tl = isSimilar(center, tl);
-    bool sim_tr = isSimilar(center, tr);
-    bool sim_bl = isSimilar(center, bl);
-    bool sim_br = isSimilar(center, br);
-
-    // Cross edges: adjacent neighbors sharing a corner
-    bool cross_tc_ml = isSimilar(tc, ml);  // top-left corner
-    bool cross_tc_mr = isSimilar(tc, mr);  // top-right corner
-    bool cross_bc_ml = isSimilar(bc, ml);  // bottom-left corner
-    bool cross_bc_mr = isSimilar(bc, mr);  // bottom-right corner
-
-    // --- STEP 4: Diagonal crossing resolution ---
-    // At each corner, two diagonals can cross. If both are connected,
-    // resolve ambiguity using the valence heuristic: keep the diagonal
-    // whose endpoints have fewer cardinal connections (sparser = preserve).
-
-    // Valence = number of cardinal connections for each neighbor
-    // (how many of the 4 cardinal neighbors of center are similar to this neighbor)
-    int val_tl_c = (sim_tc ? 1 : 0) + (sim_ml ? 1 : 0);
-    int val_br_c = (sim_bc ? 1 : 0) + (sim_mr ? 1 : 0);
-    int val_tr_c = (sim_tc ? 1 : 0) + (sim_mr ? 1 : 0);
-    int val_bl_c = (sim_bc ? 1 : 0) + (sim_ml ? 1 : 0);
-
-    // Top-left corner: TL diagonal vs BR-cross (tc-ml)
-    bool keep_tl = sim_tl;
-    if (sim_tl && cross_tc_ml) {
-      // Both diagonals active at this corner — resolve by valence
-      int val_diag = val_tl_c;  // TL endpoint valence (cardinal connections via center)
-      int val_cross = (sim_tc ? 1 : 0) + (sim_ml ? 1 : 0);  // cross endpoints
-      keep_tl = val_diag <= val_cross;  // keep sparser
-    }
-
-    // Top-right corner: TR diagonal vs cross (tc-mr)
-    bool keep_tr = sim_tr;
-    if (sim_tr && cross_tc_mr) {
-      int val_diag = val_tr_c;
-      int val_cross = (sim_tc ? 1 : 0) + (sim_mr ? 1 : 0);
-      keep_tr = val_diag <= val_cross;
-    }
-
-    // Bottom-left corner: BL diagonal vs cross (bc-ml)
-    bool keep_bl = sim_bl;
-    if (sim_bl && cross_bc_ml) {
-      int val_diag = val_bl_c;
-      int val_cross = (sim_bc ? 1 : 0) + (sim_ml ? 1 : 0);
-      keep_bl = val_diag <= val_cross;
-    }
-
-    // Bottom-right corner: BR diagonal vs cross (bc-mr)
-    bool keep_br = sim_br;
-    if (sim_br && cross_bc_mr) {
-      int val_diag = val_br_c;
-      int val_cross = (sim_bc ? 1 : 0) + (sim_mr ? 1 : 0);
-      keep_br = val_diag <= val_cross;
-    }
-
-    // --- STEP 5: Edge-aware interpolation ---
-    // Blend factors based on proximity to block edge
-    float edgeX = abs(subX) * 2.0;  // 0 at center, 1 at edge
-    float edgeY = abs(subY) * 2.0;
-
-    // Smooth blend ramps near edges (start blending at 30% from center)
-    // Tuned for 4x upscale: 2×2 blocks (edgeX=0.5) get bx≈0.21
-    float bx = smoothstep(0.3, 1.0, edgeX);
-    float by = smoothstep(0.3, 1.0, edgeY);
-
-    vec3 result = center;
-
-    // Determine which neighbors are on the near side based on subPos sign
-    bool nearLeft = subX < 0.0;
-    bool nearTop  = subY < 0.0;
-
-    // Cardinal neighbor references based on proximity
-    vec3 nearH  = nearLeft ? ml : mr;   // nearest horizontal neighbor
-    bool simH   = nearLeft ? sim_ml : sim_mr;
-    vec3 nearV  = nearTop ? tc : bc;    // nearest vertical neighbor
-    bool simV   = nearTop ? sim_tc : sim_bc;
-
-    // Diagonal neighbor for the nearest corner
-    vec3 nearDiag;
-    bool keepDiag;
-    bool crossDiag;  // whether the cross-diagonal at this corner is connected
-    if (nearLeft && nearTop) {
-      nearDiag = tl; keepDiag = keep_tl; crossDiag = cross_tc_ml;
-    } else if (!nearLeft && nearTop) {
-      nearDiag = tr; keepDiag = keep_tr; crossDiag = cross_tc_mr;
-    } else if (nearLeft && !nearTop) {
-      nearDiag = bl; keepDiag = keep_bl; crossDiag = cross_bc_ml;
-    } else {
-      nearDiag = br; keepDiag = keep_br; crossDiag = cross_bc_mr;
-    }
-
-    if (bx > 0.001 && by > 0.001) {
-      // Corner region: both axes near edge
-      float cornerBlend = bx * by;
-
-      if (keepDiag) {
-        // Diagonal connected: cell boundary cut at |fx|+|fy|=0.5
-        // Signed distance from the diagonal cell boundary
-        float fx = abs(subX);
-        float fy = abs(subY);
-        float sd = fx + fy - 0.5;
-        float diagBlend = smoothstep(-0.15, 0.15, sd);
-        result = mix(center, nearDiag, diagBlend * cornerBlend);
-      } else if (crossDiag) {
-        // Cross-diagonal won: blend toward both cardinal neighbors independently
-        if (simH) result = mix(result, nearH, bx * 0.5);
-        if (simV) result = mix(result, nearV, by * 0.5);
-      }
-      // else: neither diagonal — sharp corner, keep center
-    } else if (bx > 0.001) {
-      // Horizontal edge region only
-      if (simH) {
-        result = mix(center, nearH, bx * 0.5);
-      }
-    } else if (by > 0.001) {
-      // Vertical edge region only
-      if (simV) {
-        result = mix(center, nearV, by * 0.5);
-      }
-    }
-
-    gl_FragColor = vec4(result, 1.0);
+  // Corner w: Pixel Tap Mapping: -|-|-|-|-
+  //                              -|A|B|-|-
+  //                              x|D|E|F|-
+  //                              x|G|H|I|-
+  //                              -|x|x|-|-
+  if (!((eq(D,E) && eq(G,H)) || (eq(D,G) && eq(E,H)))) {
+    float dist_G_E = DistYCbCr(P(-2.,1.), D) + DistYCbCr(D, B) + DistYCbCr(P(-1.,2.), H) + DistYCbCr(H, F) + (4.0 * DistYCbCr(G, E));
+    float dist_D_H = DistYCbCr(P(-2.,0.), G) + DistYCbCr(G, P(0.,2.)) + DistYCbCr(A, E) + DistYCbCr(E, I) + (4.0 * DistYCbCr(D, H));
+    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_H) < dist_G_E;
+    blendResult.w = ((dist_G_E > dist_D_H) && neq(E,D) && neq(E,H)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
   }
+
+  // Corner y: Pixel Tap Mapping: -|-|x|x|-
+  //                              -|A|B|C|x
+  //                              -|D|E|F|x
+  //                              -|-|H|I|-
+  //                              -|-|-|-|-
+  if (!((eq(B,C) && eq(E,F)) || (eq(B,E) && eq(C,F)))) {
+    float dist_E_C = DistYCbCr(D, B) + DistYCbCr(B, P(1.,-2.)) + DistYCbCr(H, F) + DistYCbCr(F, P(2.,-1.)) + (4.0 * DistYCbCr(E, C));
+    float dist_B_F = DistYCbCr(A, E) + DistYCbCr(E, I) + DistYCbCr(P(0.,-2.), C) + DistYCbCr(C, P(2.,0.)) + (4.0 * DistYCbCr(B, F));
+    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_B_F) < dist_E_C;
+    blendResult.y = ((dist_E_C > dist_B_F) && neq(E,B) && neq(E,F)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
+  }
+
+  // Corner x: Pixel Tap Mapping: -|x|x|-|-
+  //                              x|A|B|C|-
+  //                              x|D|E|F|-
+  //                              -|G|H|-|-
+  //                              -|-|-|-|-
+  if (!((eq(A,B) && eq(D,E)) || (eq(A,D) && eq(B,E)))) {
+    float dist_D_B = DistYCbCr(P(-2.,0.), A) + DistYCbCr(A, P(0.,-2.)) + DistYCbCr(G, E) + DistYCbCr(E, C) + (4.0 * DistYCbCr(D, B));
+    float dist_A_E = DistYCbCr(P(-2.,-1.), D) + DistYCbCr(D, H) + DistYCbCr(P(-1.,-2.), B) + DistYCbCr(B, F) + (4.0 * DistYCbCr(A, E));
+    bool dominantGradient = (DOMINANT_DIRECTION_THRESHOLD * dist_D_B) < dist_A_E;
+    blendResult.x = ((dist_D_B < dist_A_E) && neq(E,D) && neq(E,B)) ? ((dominantGradient) ? BLEND_DOMINANT : BLEND_NORMAL) : BLEND_NONE;
+  }
+
+  fragColor = vec4(blendResult);
+
+  // --- Refine: doLineBlend + shallow/steep line detection ---
+
+  // Corner z
+  if (blendResult.z == BLEND_DOMINANT || (blendResult.z == BLEND_NORMAL &&
+      !((blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) || (blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) ||
+        (IsPixEqual(G, H) && IsPixEqual(H, I) && IsPixEqual(I, F) && IsPixEqual(F, C) && !IsPixEqual(E, I))))) {
+    fragColor.z += 4.0;
+    float dist_F_G = DistYCbCr(F, G);
+    float dist_H_C = DistYCbCr(H, C);
+    if ((STEEP_DIRECTION_THRESHOLD * dist_F_G <= dist_H_C) && neq(E,G) && neq(D,G))
+      fragColor.z += 16.0;
+    if ((STEEP_DIRECTION_THRESHOLD * dist_H_C <= dist_F_G) && neq(E,C) && neq(B,C))
+      fragColor.z += 64.0;
+  }
+
+  // Corner w
+  if (blendResult.w == BLEND_DOMINANT || (blendResult.w == BLEND_NORMAL &&
+      !((blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) || (blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) ||
+        (IsPixEqual(A, D) && IsPixEqual(D, G) && IsPixEqual(G, H) && IsPixEqual(H, I) && !IsPixEqual(E, G))))) {
+    fragColor.w += 4.0;
+    float dist_H_A = DistYCbCr(H, A);
+    float dist_D_I = DistYCbCr(D, I);
+    if ((STEEP_DIRECTION_THRESHOLD * dist_H_A <= dist_D_I) && neq(E,A) && neq(B,A))
+      fragColor.w += 16.0;
+    if ((STEEP_DIRECTION_THRESHOLD * dist_D_I <= dist_H_A) && neq(E,I) && neq(F,I))
+      fragColor.w += 64.0;
+  }
+
+  // Corner y
+  if (blendResult.y == BLEND_DOMINANT || (blendResult.y == BLEND_NORMAL &&
+      !((blendResult.x != BLEND_NONE && !IsPixEqual(E, I)) || (blendResult.z != BLEND_NONE && !IsPixEqual(E, A)) ||
+        (IsPixEqual(I, F) && IsPixEqual(F, C) && IsPixEqual(C, B) && IsPixEqual(B, A) && !IsPixEqual(E, C))))) {
+    fragColor.y += 4.0;
+    float dist_B_I = DistYCbCr(B, I);
+    float dist_F_A = DistYCbCr(F, A);
+    if ((STEEP_DIRECTION_THRESHOLD * dist_B_I <= dist_F_A) && neq(E,I) && neq(H,I))
+      fragColor.y += 16.0;
+    if ((STEEP_DIRECTION_THRESHOLD * dist_F_A <= dist_B_I) && neq(E,A) && neq(D,A))
+      fragColor.y += 64.0;
+  }
+
+  // Corner x
+  if (blendResult.x == BLEND_DOMINANT || (blendResult.x == BLEND_NORMAL &&
+      !((blendResult.w != BLEND_NONE && !IsPixEqual(E, C)) || (blendResult.y != BLEND_NONE && !IsPixEqual(E, G)) ||
+        (IsPixEqual(C, B) && IsPixEqual(B, A) && IsPixEqual(A, D) && IsPixEqual(D, G) && !IsPixEqual(E, A))))) {
+    fragColor.x += 4.0;
+    float dist_D_C = DistYCbCr(D, C);
+    float dist_B_G = DistYCbCr(B, G);
+    if ((STEEP_DIRECTION_THRESHOLD * dist_D_C <= dist_B_G) && neq(E,C) && neq(F,C))
+      fragColor.x += 16.0;
+    if ((STEEP_DIRECTION_THRESHOLD * dist_B_G <= dist_D_C) && neq(E,G) && neq(H,G))
+      fragColor.x += 64.0;
+  }
+
+  fragColor /= 255.0;
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Pass 1: xBRZ freescale blend fragment shader (W×H + W×H → 2W×2H)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fragment shader for pass 1: freescale smoothstep blending.
+ *
+ * Reads pass0 metadata from u_source and original pixel colors from u_original.
+ * Decodes packed blend flags, then for each active corner applies directional
+ * smoothstep blending — computing signed distance from the sub-pixel position
+ * to the blend line via get_left_ratio().
+ *
+ * "Freescale" means the shader works at any output scale factor (not just 2x).
+ * Scale is derived from u_outputSize / u_sourceSize.
+ *
+ * Uniforms:
+ *   u_source     — pass0 metadata texture (W × H), texture unit 0
+ *   u_original   — original ready texture (W × H), texture unit 1
+ *   u_sourceSize — original dimensions (W, H)
+ *   u_outputSize — output dimensions (2W, 2H for our 2x pipeline)
+ */
+export const XBRZ_BLEND_FRAGMENT_SRC = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+
+uniform sampler2D u_source;
+uniform sampler2D u_original;
+uniform vec2 u_sourceSize;
+uniform vec2 u_outputSize;
+
+out vec4 fragColor;
+
+#define BLEND_NONE 0.
+#define BLEND_NORMAL 1.
+#define BLEND_DOMINANT 2.
+#define LUMINANCE_WEIGHT 1.0
+#define EQUAL_COLOR_TOLERANCE (30.0 / 255.0)
+#define STEEP_DIRECTION_THRESHOLD 2.2
+
+float DistYCbCr(vec3 pixA, vec3 pixB) {
+  const vec3 w = vec3(0.2627, 0.6780, 0.0593);
+  const float scaleB = 0.5 / (1.0 - w.b);
+  const float scaleR = 0.5 / (1.0 - w.r);
+  vec3 diff = pixA - pixB;
+  float Y = dot(diff, w);
+  float Cb = scaleB * (diff.b - Y);
+  float Cr = scaleR * (diff.r - Y);
+  return sqrt(((LUMINANCE_WEIGHT * Y) * (LUMINANCE_WEIGHT * Y)) + (Cb * Cb) + (Cr * Cr));
+}
+
+bool IsPixEqual(vec3 pixA, vec3 pixB) {
+  return (DistYCbCr(pixA, pixB) < EQUAL_COLOR_TOLERANCE);
+}
+
+float get_left_ratio(vec2 center, vec2 origin, vec2 direction, vec2 scale) {
+  vec2 P0 = center - origin;
+  vec2 proj = direction * (dot(P0, direction) / dot(direction, direction));
+  vec2 distv = P0 - proj;
+  vec2 orth = vec2(-direction.y, direction.x);
+  float side = sign(dot(P0, orth));
+  float v = side * length(distv * scale);
+  return smoothstep(-sqrt(2.0) / 2.0, sqrt(2.0) / 2.0, v);
+}
+
+#define P(x,y) texture(u_original, coord + texelSize * vec2(x, y)).rgb
+
+void main() {
+  //  Input Pixel Mapping: -|B|-
+  //                       D|E|F
+  //                       -|H|-
+
+  vec2 texelSize = 1.0 / u_sourceSize;
+  vec2 scale = u_outputSize * texelSize;
+  vec2 pos = fract(v_texCoord * u_sourceSize) - vec2(0.5, 0.5);
+  vec2 coord = v_texCoord - pos * texelSize;
+
+  vec3 B = P( 0.,-1.);
+  vec3 D = P(-1., 0.);
+  vec3 E = P( 0., 0.);
+  vec3 F = P( 1., 0.);
+  vec3 H = P( 0., 1.);
+
+  vec4 info = floor(texture(u_source, coord) * 255.0 + 0.5);
+
+  // info Mapping: x|y|
+  //               w|z|
+
+  vec4 blendResult = floor(mod(info, 4.0));
+  vec4 doLineBlend = floor(mod(info / 4.0, 4.0));
+  vec4 haveShallowLine = floor(mod(info / 16.0, 4.0));
+  vec4 haveSteepLine = floor(mod(info / 64.0, 4.0));
+
+  vec3 res = E;
+
+  // Corner z: -|-|-
+  //           -|E|F
+  //           -|H|-
+  if (blendResult.z > BLEND_NONE) {
+    vec2 origin = vec2(0.0, 1.0 / sqrt(2.0));
+    vec2 direction = vec2(1.0, -1.0);
+    if (doLineBlend.z > 0.0) {
+      origin = haveShallowLine.z > 0.0 ? vec2(0.0, 0.25) : vec2(0.0, 0.5);
+      direction.x += haveShallowLine.z;
+      direction.y -= haveSteepLine.z;
+    }
+    vec3 blendPix = mix(H, F, step(DistYCbCr(E, F), DistYCbCr(E, H)));
+    res = mix(res, blendPix, get_left_ratio(pos, origin, direction, scale));
+  }
+
+  // Corner w: -|-|-
+  //           D|E|-
+  //           -|H|-
+  if (blendResult.w > BLEND_NONE) {
+    vec2 origin = vec2(-1.0 / sqrt(2.0), 0.0);
+    vec2 direction = vec2(1.0, 1.0);
+    if (doLineBlend.w > 0.0) {
+      origin = haveShallowLine.w > 0.0 ? vec2(-0.25, 0.0) : vec2(-0.5, 0.0);
+      direction.y += haveShallowLine.w;
+      direction.x += haveSteepLine.w;
+    }
+    vec3 blendPix = mix(H, D, step(DistYCbCr(E, D), DistYCbCr(E, H)));
+    res = mix(res, blendPix, get_left_ratio(pos, origin, direction, scale));
+  }
+
+  // Corner y: -|B|-
+  //           -|E|F
+  //           -|-|-
+  if (blendResult.y > BLEND_NONE) {
+    vec2 origin = vec2(1.0 / sqrt(2.0), 0.0);
+    vec2 direction = vec2(-1.0, -1.0);
+    if (doLineBlend.y > 0.0) {
+      origin = haveShallowLine.y > 0.0 ? vec2(0.25, 0.0) : vec2(0.5, 0.0);
+      direction.y -= haveShallowLine.y;
+      direction.x -= haveSteepLine.y;
+    }
+    vec3 blendPix = mix(F, B, step(DistYCbCr(E, B), DistYCbCr(E, F)));
+    res = mix(res, blendPix, get_left_ratio(pos, origin, direction, scale));
+  }
+
+  // Corner x: -|B|-
+  //           D|E|-
+  //           -|-|-
+  if (blendResult.x > BLEND_NONE) {
+    vec2 origin = vec2(0.0, -1.0 / sqrt(2.0));
+    vec2 direction = vec2(-1.0, 1.0);
+    if (doLineBlend.x > 0.0) {
+      origin = haveShallowLine.x > 0.0 ? vec2(0.0, -0.25) : vec2(0.0, -0.5);
+      direction.x -= haveShallowLine.x;
+      direction.y += haveSteepLine.x;
+    }
+    vec3 blendPix = mix(D, B, step(DistYCbCr(E, B), DistYCbCr(E, D)));
+    res = mix(res, blendPix, get_left_ratio(pos, origin, direction, scale));
+  }
+
+  fragColor = vec4(res, 1.0);
+}
 `;

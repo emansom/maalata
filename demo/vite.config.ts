@@ -1,4 +1,5 @@
 import { defineConfig, type Plugin } from 'vite';
+import { resolve } from 'path';
 import minifyHtml from '@minify-html/node';
 import { buildHash, sharedEsbuildOptions, sharedTreeshake, sharedCompactOutput, sharedCompressionPlugins } from '../vite.config.shared';
 
@@ -20,6 +21,10 @@ export default defineConfig(({ mode }) => {
       sourcemap: dev,
       minify: dev ? false : 'esbuild',
       rollupOptions: {
+        input: {
+          main: resolve(__dirname, 'index.html'),
+          smoothing: resolve(__dirname, 'smoothing.html'),
+        },
         treeshake: sharedTreeshake,
         output: {
           ...sharedCompactOutput,
