@@ -48,7 +48,8 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 
 - **`maalata.ts`**: `CanvasRenderer` class. Creates `UltrafastRenderer`, immediately `stopDisplay()`. Builds 4-stage latency pipeline. Manages CRT display and idle shutdown.
 - **`pipeline.ts`**: USB(8ms) → OS(10ms) → App(125ms) → LCD(25ms) latency simulation.
-- **`crt-display.ts`**: `CRTDisplay` class. Owns its own RAF loop, reads ready texture from UltrafastRenderer, applies CRT shader.
+- **`crt-display.ts`**: `CRTDisplay` class. Owns its own RAF loop, reads ready texture from UltrafastRenderer, applies two-pass rendering: Kopf-Lischinski smoothing → CRT shader.
+- **`smooth-shaders.ts`**: Kopf-Lischinski pixel art smoothing fragment GLSL (block detection, YUV similarity, diagonal resolution, edge-aware interpolation).
 - **`crt-shaders.ts`**: CRT vertex + fragment GLSL (barrel distortion, pixel beam, chromatic aberration, etc.).
 
 ### Key design decisions
@@ -60,6 +61,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **esbuild `mangleProps: /^_/`**: All `_`-prefixed properties are renamed in production. Cross-file methods must NOT use `_` prefix. Each package mangles independently.
 - **Pixel beam (Gaussian CRT phosphor dots)**: Step 10 renders each virtual CRT pixel as a 2D Gaussian with brightness-dependent width. Replaces both the sin-based scanlines and mod-based dot mask — on real CRTs, scanline gaps were created by the beam's vertical profile (same physical effect as horizontal dot shaping). Auto-derived from canvas size: `beamScale = max(3.0, height/180)`. No CRTConfig fields; always active.
 - **CRT colorspace (BT.1886 → sRGB)**: Shader decodes with γ=2.4 (BT.1886 CRT phosphor response), processes effects in linear space, encodes with γ=2.2 (sRGB). Net gamma 1.09 = authentic CRT contrast. No color primary conversion needed (PC P22 phosphors ≈ sRGB). WebGL RGBA textures have no hardware sRGB — all gamma is manual via `pow()`. See `crt-shaders.ts` file header for full rationale.
+- **Pixel art smoothing (Kopf-Lischinski)**: Pre-processing pass in `smooth-shaders.ts`, runs before CRT effects. Adapts Kopf-Lischinski depixelization for per-fragment WebGL2: block detection finds logical pixel scale, YUV similarity graph with perceptual thresholds (Y<=48, U<=7, V<=6), diagonal crossing resolution via valence heuristic, edge-aware interpolation at block boundaries with diagonal cell cuts. Renders to intermediate FBO; CRT shader reads smoothed result. Bypassed when `_inputSize: [0, 0]`. Always active.
 
 ### Renderer events
 

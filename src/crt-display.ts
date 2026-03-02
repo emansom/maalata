@@ -14,6 +14,7 @@
  */
 
 import { CRT_VERTEX_SRC, CRT_FRAGMENT_SRC } from './crt-shaders';
+import { SMOOTH_FRAGMENT_SRC } from './smooth-shaders';
 
 export interface CRTConfig {
   barrelDistortion: number;
@@ -115,6 +116,13 @@ export class CRTDisplay {
   private _lastCrtCycle = -1;
   private _historyInitialized = false;
 
+  // Kopf-Lischinski smoothing pass
+  private _smoothProgram: WebGLProgram;
+  private _smoothInputSizeLoc: WebGLUniformLocation | null;
+  private _smoothPositionLoc: number;
+  private _intermediateFbo: WebGLFramebuffer;
+  private _intermediateTexture: WebGLTexture;
+
   constructor(
     gl: WebGL2RenderingContext,
     canvas: HTMLCanvasElement,
@@ -145,6 +153,29 @@ export class CRTDisplay {
     ]), gl.STATIC_DRAW);
 
     this._quadPositionLoc = gl.getAttribLocation(this._program, 'a_position');
+
+    // Create Kopf-Lischinski smoothing program
+    this._smoothProgram = this._createShaderProgram(CRT_VERTEX_SRC, SMOOTH_FRAGMENT_SRC);
+    gl.useProgram(this._smoothProgram);
+    this._smoothInputSizeLoc = gl.getUniformLocation(this._smoothProgram, 'u_inputSize');
+    this._smoothPositionLoc = gl.getAttribLocation(this._smoothProgram, 'a_position');
+    const smoothTexLoc = gl.getUniformLocation(this._smoothProgram, 'u_texture');
+    gl.uniform1i(smoothTexLoc, 0);
+
+    // Intermediate FBO for smoothing output
+    this._intermediateTexture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, this._intermediateTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    this._intermediateFbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._intermediateTexture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
   /** Render one CRT frame — reads ready texture, applies effects, blits to screen. */
@@ -153,6 +184,23 @@ export class CRTDisplay {
 
     const gl = this._gl;
     const u = this._uniforms;
+    const smoothingActive = !this._inputSizeOverride || this._inputSizeOverride[1] > 0;
+
+    // --- Pass 1: Kopf-Lischinski smoothing ---
+    if (smoothingActive) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
+      gl.viewport(0, 0, this._canvas.width, this._canvas.height);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this._getReadyTexture());
+      gl.useProgram(this._smoothProgram);
+      gl.uniform2f(this._smoothInputSizeLoc!, this._canvas.width, this._canvas.height);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
+      gl.enableVertexAttribArray(this._smoothPositionLoc);
+      gl.vertexAttribPointer(this._smoothPositionLoc, 2, gl.FLOAT, false, 0, 0);
+      gl.disable(gl.BLEND);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.enable(gl.BLEND);
+    }
 
     // BFI: detect cycle boundary, capture frame, bind history, set uniforms
     if (this._bfiActive && this._historyInitialized) {
@@ -179,9 +227,11 @@ export class CRTDisplay {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this._canvas.width, this._canvas.height);
 
-    // Bind ready texture
+    // Bind input texture: smoothed intermediate or raw ready texture
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this._getReadyTexture());
+    gl.bindTexture(gl.TEXTURE_2D,
+      smoothingActive ? this._intermediateTexture : this._getReadyTexture()
+    );
 
     // Use CRT program
     gl.useProgram(this._program);
@@ -251,7 +301,10 @@ export class CRTDisplay {
     this.stop();
     const gl = this._gl;
     gl.deleteProgram(this._program);
+    gl.deleteProgram(this._smoothProgram);
     gl.deleteBuffer(this._quadVBO);
+    gl.deleteFramebuffer(this._intermediateFbo);
+    gl.deleteTexture(this._intermediateTexture);
 
     // Clean up BFI frame history resources
     for (const tex of this._historyTextures) gl.deleteTexture(tex);
@@ -386,15 +439,17 @@ export class CRTDisplay {
     this._historyInitialized = true;
   }
 
-  /** GPU-copy ready texture into current history slot via blitFramebuffer. */
+  /** GPU-copy source texture into current history slot via blitFramebuffer. */
   private _captureFrame(): void {
     const gl = this._gl;
     const w = this._canvas.width;
     const h = this._canvas.height;
+    const smoothingActive = !this._inputSizeOverride || this._inputSizeOverride[1] > 0;
 
-    // Bind ready texture as READ source
+    // Bind source texture as READ: smoothed intermediate when active, else raw ready
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._srcFbo);
-    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._getReadyTexture(), 0);
+    const srcTex = smoothingActive ? this._intermediateTexture : this._getReadyTexture();
+    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, srcTex, 0);
 
     // Bind current history slot as DRAW target
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this._historyFbos[this._historyIndex]);

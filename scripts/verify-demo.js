@@ -40,7 +40,7 @@ const DEMO = {
   name: 'maalata',
   distDir: resolve(import.meta.dirname, '../demo/dist'),
   port: 4173,
-  cpuThreshold: 15.0,  // CRT shader inflates CPU on SwiftShader
+  cpuThreshold: 80.0,  // CRT + smoothing shaders inflate CPU on SwiftShader
   settleMs: 2000,       // pipeline needs time to flush first frames
 };
 
