@@ -1,37 +1,54 @@
 /**
  * Standalone Pixel Art Smoothing Display
  *
- * Three-pass rendering pipeline that smooths pixel art edges without CRT
+ * Nine-pass rendering pipeline that smooths pixel art edges without CRT
  * effects. Targets 1:1 pixel art — consumers draw at native resolution and
  * get improved visuals automatically, no code changes needed.
  *
  * NEAREST filtering is inherited from canvas-ultrafast (all FBO textures use
- * gl.NEAREST by default), so no per-draw filter overrides are needed.
+ * gl.NEAREST by default). AA level2 passes (6, 7) temporarily switch input
+ * textures to LINEAR for fractional-texel bilinear interpolation, then
+ * restore NEAREST after rendering.
  *
- *   Pass 0: xBRZ analysis — blend metadata output (W×H → W×H)
- *   Pass 1: xBRZ freescale blend — smoothstep directional blending (W×H → 2W×2H)
- *   Pass 2: RGSS downsample — rotated grid anti-aliasing (2W×2H → W×H)
+ *   Pass 0: ScaleFX metric — Compuphase color distance (W×H → W×H RGBA16F)
+ *   Pass 1: ScaleFX strength — corner interpolation (W×H → W×H RGBA16F)
+ *   Pass 2: ScaleFX ambiguity — dominance voting (W×H → W×H RGBA8)
+ *   Pass 3: ScaleFX edge level — 6-level classification (W×H → W×H RGBA8)
+ *   Pass 4: ScaleFX 3× output — tag decode → color lookup (W×H → 3W×3H RGBA8)
+ *   Pass 5: Sharpsmoother — edge-preserving smoothing (3W×3H → 3W×3H RGBA8)
+ *   Pass 6: AA level2 pass 1 — 13-point directional AA (3W×3H → 3W×3H RGBA8)
+ *   Pass 7: AA level2 pass 2 — 4-point diagonal AA (3W×3H → 3W×3H RGBA8)
+ *   Pass 8: EWA smooth downsample — raised-cosine polar 8×8 (3W×3H → W×H RGBA8)
  *
  * Can be used standalone (render() blits to screen) or as a delegate inside
  * CRTDisplay (renderSmoothing() + getSmoothedTexture() for CRT to read).
  *
- * screenshotUpscaled() reads the 2W×2H upscaled FBO (pass 1 output, before
- * RGSS downsample) via readPixels and returns it as an ImageBitmap — useful
- * for visualizing the xBRZ freescale output at native 2× resolution.
+ * screenshotUpscaled() uses the EWA smooth downsample shader on the GPU to
+ * reduce the 3W×3H post-AA FBO to 2W×2H, then reads via readPixels and
+ * returns as an ImageBitmap — useful for visualizing the ScaleFX+AA output
+ * at 2× resolution.
  *
- * xBRZ Freescale uses YCbCr perceptual color distance with dominant gradient
- * detection and shallow/steep line classification. Pass 0 outputs packed
- * blend metadata (not colors); pass 1 reads original pixels and applies
- * smoothstep blending at arbitrary scale factors. Purely algorithmic — no
- * lookup tables or async loading needed.
+ * ScaleFX uses Compuphase perceptual color distance with 6-level edge
+ * classification and precise slope detection. Passes 0-3 output packed
+ * metadata (not colors); pass 4 reads original pixels and maps 3×3 subpixel
+ * grid to source colors. Sharpsmoother adds edge-preserving color blending.
+ * AA level2 provides multi-directional anti-aliasing refinement. Purely
+ * algorithmic — no lookup tables or async loading needed.
  *
- * Total VRAM: 6 WH (analysis W×H + upscaled 2W×2H + intermediate W×H).
+ * Total VRAM: 25 WH (2×RGBA16F W×H + 2×RGBA8 W×H + 2×RGBA8 3W×3H + 1×RGBA8 W×H).
+ * Requires EXT_color_buffer_float for RGBA16F render targets (99%+ WebGL2).
  */
 
 import { CRT_VERTEX_SRC } from './crt-shaders';
 import {
-  XBRZ_ANALYSIS_FRAGMENT_SRC,
-  XBRZ_BLEND_FRAGMENT_SRC,
+  SCALEFX_PASS0_FRAGMENT_SRC,
+  SCALEFX_PASS1_FRAGMENT_SRC,
+  SCALEFX_PASS2_FRAGMENT_SRC,
+  SCALEFX_PASS3_FRAGMENT_SRC,
+  SCALEFX_PASS4_FRAGMENT_SRC,
+  SHARPSMOOTHER_FRAGMENT_SRC,
+  AA_LEVEL2_PASS1_FRAGMENT_SRC,
+  AA_LEVEL2_PASS2_FRAGMENT_SRC,
 } from './smooth-shaders';
 import { DOWNSAMPLE_FRAGMENT_SRC } from './downsample-shaders';
 
@@ -45,29 +62,63 @@ export class SmoothingDisplay {
   // Fullscreen quad VBO (shared by all programs)
   private _quadVBO: WebGLBuffer;
 
-  // Pass 0: xBRZ analysis (source W×H → metadata W×H)
-  private _analysisProgram: WebGLProgram;
-  private _analysisSourceSizeLoc: WebGLUniformLocation | null;
-  private _analysisPositionLoc: number;
-  private _analysisFbo: WebGLFramebuffer;
-  private _analysisTexture: WebGLTexture;
+  // --- 9 shader programs ---
+  private _pass0Program: WebGLProgram;  // ScaleFX metric
+  private _pass1Program: WebGLProgram;  // ScaleFX strength
+  private _pass2Program: WebGLProgram;  // ScaleFX ambiguity
+  private _pass3Program: WebGLProgram;  // ScaleFX edge level
+  private _pass4Program: WebGLProgram;  // ScaleFX 3× output
+  private _pass5Program: WebGLProgram;  // Sharpsmoother
+  private _pass6Program: WebGLProgram;  // AA level2 pass 1
+  private _pass7Program: WebGLProgram;  // AA level2 pass 2
+  private _pass8Program: WebGLProgram;  // EWA smooth downsample
 
-  // Pass 1: xBRZ freescale blend (W×H metadata + W×H original → 2W×2H)
-  private _upscaleProgram: WebGLProgram;
-  private _upscaleSourceSizeLoc: WebGLUniformLocation | null;
-  private _upscaleOutputSizeLoc: WebGLUniformLocation | null;
-  private _upscalePositionLoc: number;
-  private _upscaledFbo: WebGLFramebuffer;
-  private _upscaledTexture: WebGLTexture;
+  // --- Uniform locations ---
+  private _pass0SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass0PositionLoc: number;
 
-  // Pass 2: RGSS downsample (2W×2H → W×H)
-  private _downsampleProgram: WebGLProgram;
-  private _downsampleSourceSizeLoc: WebGLUniformLocation | null;
-  private _downsamplePositionLoc: number;
+  private _pass1SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass1PositionLoc: number;
 
-  // Final output FBO (W × H)
+  private _pass2SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass2PositionLoc: number;
+
+  private _pass3SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass3PositionLoc: number;
+
+  private _pass4SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass4PositionLoc: number;
+
+  private _pass5SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass5PositionLoc: number;
+
+  private _pass6SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass6PositionLoc: number;
+
+  private _pass7SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass7PositionLoc: number;
+
+  private _pass8SourceSizeLoc: WebGLUniformLocation | null;
+  private _pass8DownscaleFactorLoc: WebGLUniformLocation | null;
+  private _pass8PositionLoc: number;
+
+  // --- FBO textures ---
+  private _metricTexture: WebGLTexture;      // W×H RGBA16F (pass 0 output)
+  private _strengthTexture: WebGLTexture;    // W×H RGBA16F (pass 1 output)
+  private _ambiguityTexture: WebGLTexture;   // W×H RGBA8 (pass 2 output)
+  private _edgeLevelTexture: WebGLTexture;   // W×H RGBA8 (pass 3 output)
+  private _upscaledA: WebGLTexture;          // 3W×3H RGBA8 (ping-pong A)
+  private _upscaledB: WebGLTexture;          // 3W×3H RGBA8 (ping-pong B)
+  private _intermediateTexture: WebGLTexture; // W×H RGBA8 (pass 8 output)
+
+  // --- FBOs ---
+  private _metricFbo: WebGLFramebuffer;
+  private _strengthFbo: WebGLFramebuffer;
+  private _ambiguityFbo: WebGLFramebuffer;
+  private _edgeLevelFbo: WebGLFramebuffer;
+  private _upscaledAFbo: WebGLFramebuffer;
+  private _upscaledBFbo: WebGLFramebuffer;
   private _intermediateFbo: WebGLFramebuffer;
-  private _intermediateTexture: WebGLTexture;
 
   constructor(
     gl: WebGL2RenderingContext,
@@ -80,10 +131,16 @@ export class SmoothingDisplay {
     this._getReadyTexture = getReadyTexture;
     this._hasContent = hasContent;
 
+    // Check for RGBA16F render target support
+    const ext = gl.getExtension('EXT_color_buffer_float');
+    if (!ext) {
+      throw new Error('maalata: EXT_color_buffer_float required for ScaleFX smoothing pipeline');
+    }
+
     const w = canvas.width;
     const h = canvas.height;
-    const w2 = w * 2;
-    const h2 = h * 2;
+    const w3 = w * 3;
+    const h3 = h * 3;
 
     // Create fullscreen quad VBO
     this._quadVBO = gl.createBuffer()!;
@@ -93,151 +150,237 @@ export class SmoothingDisplay {
       0, 1,  1, 0,  1, 1,
     ]), gl.STATIC_DRAW);
 
-    // --- Pass 0: xBRZ analysis program (CRT vertex + analysis fragment) ---
-    this._analysisProgram = this._createShaderProgram(
-      CRT_VERTEX_SRC, XBRZ_ANALYSIS_FRAGMENT_SRC);
-    gl.useProgram(this._analysisProgram);
-    this._analysisSourceSizeLoc = gl.getUniformLocation(
-      this._analysisProgram, 'u_sourceSize');
-    this._analysisPositionLoc = gl.getAttribLocation(
-      this._analysisProgram, 'a_position');
-    const analysisSourceLoc = gl.getUniformLocation(
-      this._analysisProgram, 'u_source');
-    gl.uniform1i(analysisSourceLoc, 0);  // texture unit 0
+    // --- Pass 0: ScaleFX metric ---
+    this._pass0Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SCALEFX_PASS0_FRAGMENT_SRC);
+    gl.useProgram(this._pass0Program);
+    this._pass0SourceSizeLoc = gl.getUniformLocation(this._pass0Program, 'u_sourceSize');
+    this._pass0PositionLoc = gl.getAttribLocation(this._pass0Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass0Program, 'u_source'), 0);
 
-    // Analysis FBO (W × H)
-    this._analysisTexture = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this._analysisTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // --- Pass 1: ScaleFX strength ---
+    this._pass1Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SCALEFX_PASS1_FRAGMENT_SRC);
+    gl.useProgram(this._pass1Program);
+    this._pass1SourceSizeLoc = gl.getUniformLocation(this._pass1Program, 'u_sourceSize');
+    this._pass1PositionLoc = gl.getAttribLocation(this._pass1Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass1Program, 'u_source'), 0);
 
-    this._analysisFbo = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._analysisFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D, this._analysisTexture, 0);
+    // --- Pass 2: ScaleFX ambiguity ---
+    this._pass2Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SCALEFX_PASS2_FRAGMENT_SRC);
+    gl.useProgram(this._pass2Program);
+    this._pass2SourceSizeLoc = gl.getUniformLocation(this._pass2Program, 'u_sourceSize');
+    this._pass2PositionLoc = gl.getAttribLocation(this._pass2Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass2Program, 'u_source'), 0);
+    gl.uniform1i(gl.getUniformLocation(this._pass2Program, 'u_metricTex'), 1);
 
-    // --- Pass 1: xBRZ freescale blend program (CRT vertex + blend fragment) ---
-    this._upscaleProgram = this._createShaderProgram(
-      CRT_VERTEX_SRC, XBRZ_BLEND_FRAGMENT_SRC);
-    gl.useProgram(this._upscaleProgram);
-    this._upscaleSourceSizeLoc = gl.getUniformLocation(
-      this._upscaleProgram, 'u_sourceSize');
-    this._upscaleOutputSizeLoc = gl.getUniformLocation(
-      this._upscaleProgram, 'u_outputSize');
-    this._upscalePositionLoc = gl.getAttribLocation(
-      this._upscaleProgram, 'a_position');
-    const upscaleSourceLoc = gl.getUniformLocation(
-      this._upscaleProgram, 'u_source');
-    gl.uniform1i(upscaleSourceLoc, 0);   // texture unit 0: pass0 metadata
-    const upscaleOriginalLoc = gl.getUniformLocation(
-      this._upscaleProgram, 'u_original');
-    gl.uniform1i(upscaleOriginalLoc, 1); // texture unit 1: original source
+    // --- Pass 3: ScaleFX edge level ---
+    this._pass3Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SCALEFX_PASS3_FRAGMENT_SRC);
+    gl.useProgram(this._pass3Program);
+    this._pass3SourceSizeLoc = gl.getUniformLocation(this._pass3Program, 'u_sourceSize');
+    this._pass3PositionLoc = gl.getAttribLocation(this._pass3Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass3Program, 'u_source'), 0);
 
-    // Upscaled FBO (2W × 2H)
-    this._upscaledTexture = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this._upscaledTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w2, h2, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // --- Pass 4: ScaleFX 3× output ---
+    this._pass4Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SCALEFX_PASS4_FRAGMENT_SRC);
+    gl.useProgram(this._pass4Program);
+    this._pass4SourceSizeLoc = gl.getUniformLocation(this._pass4Program, 'u_sourceSize');
+    this._pass4PositionLoc = gl.getAttribLocation(this._pass4Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass4Program, 'u_source'), 0);
+    gl.uniform1i(gl.getUniformLocation(this._pass4Program, 'u_originalTex'), 1);
 
-    this._upscaledFbo = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D, this._upscaledTexture, 0);
+    // --- Pass 5: Sharpsmoother ---
+    this._pass5Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, SHARPSMOOTHER_FRAGMENT_SRC);
+    gl.useProgram(this._pass5Program);
+    this._pass5SourceSizeLoc = gl.getUniformLocation(this._pass5Program, 'u_sourceSize');
+    this._pass5PositionLoc = gl.getAttribLocation(this._pass5Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass5Program, 'u_source'), 0);
 
-    // --- Pass 2: RGSS downsample program (CRT vertex + downsample fragment) ---
-    this._downsampleProgram = this._createShaderProgram(
+    // --- Pass 6: AA level2 pass 1 ---
+    this._pass6Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, AA_LEVEL2_PASS1_FRAGMENT_SRC);
+    gl.useProgram(this._pass6Program);
+    this._pass6SourceSizeLoc = gl.getUniformLocation(this._pass6Program, 'u_sourceSize');
+    this._pass6PositionLoc = gl.getAttribLocation(this._pass6Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass6Program, 'u_source'), 0);
+
+    // --- Pass 7: AA level2 pass 2 ---
+    this._pass7Program = this._createShaderProgram(
+      CRT_VERTEX_SRC, AA_LEVEL2_PASS2_FRAGMENT_SRC);
+    gl.useProgram(this._pass7Program);
+    this._pass7SourceSizeLoc = gl.getUniformLocation(this._pass7Program, 'u_sourceSize');
+    this._pass7PositionLoc = gl.getAttribLocation(this._pass7Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass7Program, 'u_source'), 0);
+
+    // --- Pass 8: EWA smooth downsample ---
+    this._pass8Program = this._createShaderProgram(
       CRT_VERTEX_SRC, DOWNSAMPLE_FRAGMENT_SRC);
-    gl.useProgram(this._downsampleProgram);
-    this._downsampleSourceSizeLoc = gl.getUniformLocation(
-      this._downsampleProgram, 'u_sourceSize');
-    this._downsamplePositionLoc = gl.getAttribLocation(
-      this._downsampleProgram, 'a_position');
-    const downsampleTexLoc = gl.getUniformLocation(
-      this._downsampleProgram, 'u_texture');
-    gl.uniform1i(downsampleTexLoc, 0);
+    gl.useProgram(this._pass8Program);
+    this._pass8SourceSizeLoc = gl.getUniformLocation(this._pass8Program, 'u_sourceSize');
+    this._pass8DownscaleFactorLoc = gl.getUniformLocation(this._pass8Program, 'u_downscaleFactor');
+    this._pass8PositionLoc = gl.getAttribLocation(this._pass8Program, 'a_position');
+    gl.uniform1i(gl.getUniformLocation(this._pass8Program, 'u_texture'), 0);
 
-    // Final output FBO (W × H)
-    this._intermediateTexture = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this._intermediateTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // --- Create FBO textures ---
 
-    this._intermediateFbo = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D, this._intermediateTexture, 0);
+    // Metric texture: W×H RGBA16F
+    this._metricTexture = this._createTexture(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    this._metricFbo = this._createFbo(this._metricTexture);
+
+    // Strength texture: W×H RGBA16F
+    this._strengthTexture = this._createTexture(w, h, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    this._strengthFbo = this._createFbo(this._strengthTexture);
+
+    // Ambiguity texture: W×H RGBA8
+    this._ambiguityTexture = this._createTexture(w, h, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    this._ambiguityFbo = this._createFbo(this._ambiguityTexture);
+
+    // Edge level texture: W×H RGBA8
+    this._edgeLevelTexture = this._createTexture(w, h, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    this._edgeLevelFbo = this._createFbo(this._edgeLevelTexture);
+
+    // Upscaled A: 3W×3H RGBA8 (ping-pong)
+    this._upscaledA = this._createTexture(w3, h3, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    this._upscaledAFbo = this._createFbo(this._upscaledA);
+
+    // Upscaled B: 3W×3H RGBA8 (ping-pong)
+    this._upscaledB = this._createTexture(w3, h3, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    this._upscaledBFbo = this._createFbo(this._upscaledB);
+
+    // Intermediate texture: W×H RGBA8 (final output)
+    this._intermediateTexture = this._createTexture(w, h, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    this._intermediateFbo = this._createFbo(this._intermediateTexture);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
-  /** Run passes 0-2 (xBRZ analysis → xBRZ freescale blend → RGSS downsample) into internal FBO. */
+  /** Run passes 0-8 (ScaleFX → sharpsmoother → AA → EWA downsample) into internal FBO. */
   renderSmoothing(): void {
     const gl = this._gl;
     const w = this._canvas.width;
     const h = this._canvas.height;
-    const w2 = w * 2;
-    const h2 = h * 2;
+    const w3 = w * 3;
+    const h3 = h * 3;
 
     const readyTex = this._getReadyTexture();
 
-    // --- Pass 0: xBRZ analysis (W×H → W×H metadata) ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._analysisFbo);
-    gl.viewport(0, 0, w, h);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
+    gl.disable(gl.BLEND);
 
+    // --- Pass 0: ScaleFX metric (original → metricTex, W×H) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._metricFbo);
+    gl.viewport(0, 0, w, h);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, readyTex);
-
-    gl.useProgram(this._analysisProgram);
-    gl.uniform2f(this._analysisSourceSizeLoc!, w, h);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
-    gl.enableVertexAttribArray(this._analysisPositionLoc);
-    gl.vertexAttribPointer(
-      this._analysisPositionLoc, 2, gl.FLOAT, false, 0, 0);
-    gl.disable(gl.BLEND);
+    gl.useProgram(this._pass0Program);
+    gl.uniform2f(this._pass0SourceSizeLoc!, w, h);
+    gl.enableVertexAttribArray(this._pass0PositionLoc);
+    gl.vertexAttribPointer(this._pass0PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // --- Pass 1: xBRZ freescale blend (W×H metadata + W×H original → 2W×2H) ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledFbo);
-    gl.viewport(0, 0, w2, h2);
-
-    // Unit 0: pass0 metadata
+    // --- Pass 1: ScaleFX strength (metricTex → strengthTex, W×H) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._strengthFbo);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this._analysisTexture);
-    // Unit 1: original ready texture
+    gl.bindTexture(gl.TEXTURE_2D, this._metricTexture);
+    gl.useProgram(this._pass1Program);
+    gl.uniform2f(this._pass1SourceSizeLoc!, w, h);
+    gl.enableVertexAttribArray(this._pass1PositionLoc);
+    gl.vertexAttribPointer(this._pass1PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // --- Pass 2: ScaleFX ambiguity (strengthTex + metricTex → ambiguityTex, W×H) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._ambiguityFbo);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._strengthTexture);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this._metricTexture);
+    gl.useProgram(this._pass2Program);
+    gl.uniform2f(this._pass2SourceSizeLoc!, w, h);
+    gl.enableVertexAttribArray(this._pass2PositionLoc);
+    gl.vertexAttribPointer(this._pass2PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // --- Pass 3: ScaleFX edge level (ambiguityTex → edgeLevelTex, W×H) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._edgeLevelFbo);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._ambiguityTexture);
+    gl.useProgram(this._pass3Program);
+    gl.uniform2f(this._pass3SourceSizeLoc!, w, h);
+    gl.enableVertexAttribArray(this._pass3PositionLoc);
+    gl.vertexAttribPointer(this._pass3PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // --- Pass 4: ScaleFX 3× output (edgeLevelTex + original → upscaledA, 3W×3H) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledAFbo);
+    gl.viewport(0, 0, w3, h3);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._edgeLevelTexture);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, readyTex);
-
-    gl.useProgram(this._upscaleProgram);
-    gl.uniform2f(this._upscaleSourceSizeLoc!, w, h);
-    gl.uniform2f(this._upscaleOutputSizeLoc!, w2, h2);
-    gl.enableVertexAttribArray(this._upscalePositionLoc);
-    gl.vertexAttribPointer(
-      this._upscalePositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.useProgram(this._pass4Program);
+    gl.uniform2f(this._pass4SourceSizeLoc!, w, h);
+    gl.enableVertexAttribArray(this._pass4PositionLoc);
+    gl.vertexAttribPointer(this._pass4PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // --- Pass 2: RGSS downsample (2W×2H → W×H) ---
+    // --- Pass 5: Sharpsmoother (upscaledA → upscaledB, 3W×3H, NEAREST) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledBFbo);
     gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledA);
+    gl.useProgram(this._pass5Program);
+    gl.uniform2f(this._pass5SourceSizeLoc!, w3, h3);
+    gl.enableVertexAttribArray(this._pass5PositionLoc);
+    gl.vertexAttribPointer(this._pass5PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // --- Pass 6: AA level2 pass 1 (upscaledB → upscaledA, 3W×3H, LINEAR) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledAFbo);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
+    // AA passes need LINEAR filtering for fractional texel offsets
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.useProgram(this._pass6Program);
+    gl.uniform2f(this._pass6SourceSizeLoc!, w3, h3);
+    gl.enableVertexAttribArray(this._pass6PositionLoc);
+    gl.vertexAttribPointer(this._pass6PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    // Restore NEAREST
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+    // --- Pass 7: AA level2 pass 2 (upscaledA → upscaledB, 3W×3H, LINEAR) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledBFbo);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledA);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.useProgram(this._pass7Program);
+    gl.uniform2f(this._pass7SourceSizeLoc!, w3, h3);
+    gl.enableVertexAttribArray(this._pass7PositionLoc);
+    gl.vertexAttribPointer(this._pass7PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    // Restore NEAREST
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+    // --- Pass 8: EWA smooth downsample (upscaledB → intermediateTex, W×H) ---
     gl.bindFramebuffer(gl.FRAMEBUFFER, this._intermediateFbo);
     gl.viewport(0, 0, w, h);
-    gl.bindTexture(gl.TEXTURE_2D, this._upscaledTexture);
-    gl.useProgram(this._downsampleProgram);
-    gl.uniform2f(this._downsampleSourceSizeLoc!, w2, h2);
-    gl.enableVertexAttribArray(this._downsamplePositionLoc);
-    gl.vertexAttribPointer(
-      this._downsamplePositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
+    gl.useProgram(this._pass8Program);
+    gl.uniform2f(this._pass8SourceSizeLoc!, w3, h3);
+    gl.uniform1f(this._pass8DownscaleFactorLoc!, 3.0);
+    gl.enableVertexAttribArray(this._pass8PositionLoc);
+    gl.vertexAttribPointer(this._pass8PositionLoc, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+
     gl.enable(gl.BLEND);
   }
 
@@ -278,19 +421,44 @@ export class SmoothingDisplay {
   }
 
   /**
-   * Read the 2W×2H upscaled FBO (pass 1 output, before RGSS downsample)
-   * via readPixels, flip Y, and return as an ImageBitmap.
+   * GPU-downsample the 3W×3H post-AA FBO to 2W×2H using the EWA smooth
+   * downsample shader at u_downscaleFactor=1.5, then read via readPixels
+   * and return as an ImageBitmap.
    */
   async screenshotUpscaled(): Promise<ImageBitmap> {
     if (this._hasContent()) this.renderSmoothing();
     const gl = this._gl;
     const w = this._canvas.width, h = this._canvas.height;
     const w2 = w * 2, h2 = h * 2;
+    const w3 = w * 3, h3 = h * 3;
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this._upscaledFbo);
+    // Create temporary texture + FBO at 2W×2H
+    const tmpTexture = this._createTexture(w2, h2, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+    const tmpFbo = this._createFbo(tmpTexture);
+
+    // Render through EWA smooth downsample at 1.5× scale (3W×3H → 2W×2H)
+    gl.viewport(0, 0, w2, h2);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._upscaledB);
+    gl.useProgram(this._pass8Program);
+    gl.uniform2f(this._pass8SourceSizeLoc!, w3, h3);
+    gl.uniform1f(this._pass8DownscaleFactorLoc!, 1.5);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quadVBO);
+    gl.enableVertexAttribArray(this._pass8PositionLoc);
+    gl.vertexAttribPointer(
+      this._pass8PositionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.disable(gl.BLEND);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.enable(gl.BLEND);
+
+    // Read pixels from temp FBO
     const pixels = new Uint8Array(w2 * h2 * 4);
     gl.readPixels(0, 0, w2, h2, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    // Clean up temp resources
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(tmpFbo);
+    gl.deleteTexture(tmpTexture);
 
     // Flip Y (WebGL bottom-up → canvas top-down)
     const rowSize = w2 * 4;
@@ -309,14 +477,34 @@ export class SmoothingDisplay {
   destroy(): void {
     this.stop();
     const gl = this._gl;
-    gl.deleteProgram(this._analysisProgram);
-    gl.deleteProgram(this._upscaleProgram);
-    gl.deleteProgram(this._downsampleProgram);
+
+    // Delete 9 programs
+    gl.deleteProgram(this._pass0Program);
+    gl.deleteProgram(this._pass1Program);
+    gl.deleteProgram(this._pass2Program);
+    gl.deleteProgram(this._pass3Program);
+    gl.deleteProgram(this._pass4Program);
+    gl.deleteProgram(this._pass5Program);
+    gl.deleteProgram(this._pass6Program);
+    gl.deleteProgram(this._pass7Program);
+    gl.deleteProgram(this._pass8Program);
+
+    // Delete quad VBO
     gl.deleteBuffer(this._quadVBO);
-    gl.deleteFramebuffer(this._analysisFbo);
-    gl.deleteTexture(this._analysisTexture);
-    gl.deleteFramebuffer(this._upscaledFbo);
-    gl.deleteTexture(this._upscaledTexture);
+
+    // Delete 7 FBOs + 7 textures
+    gl.deleteFramebuffer(this._metricFbo);
+    gl.deleteTexture(this._metricTexture);
+    gl.deleteFramebuffer(this._strengthFbo);
+    gl.deleteTexture(this._strengthTexture);
+    gl.deleteFramebuffer(this._ambiguityFbo);
+    gl.deleteTexture(this._ambiguityTexture);
+    gl.deleteFramebuffer(this._edgeLevelFbo);
+    gl.deleteTexture(this._edgeLevelTexture);
+    gl.deleteFramebuffer(this._upscaledAFbo);
+    gl.deleteTexture(this._upscaledA);
+    gl.deleteFramebuffer(this._upscaledBFbo);
+    gl.deleteTexture(this._upscaledB);
     gl.deleteFramebuffer(this._intermediateFbo);
     gl.deleteTexture(this._intermediateTexture);
   }
@@ -328,6 +516,31 @@ export class SmoothingDisplay {
   private _loop(): void {
     this._rafId = requestAnimationFrame(() => this._loop());
     this.render();
+  }
+
+  private _createTexture(
+    width: number, height: number,
+    internalFormat: number, format: number, type: number,
+  ): WebGLTexture {
+    const gl = this._gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0,
+      format, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return tex;
+  }
+
+  private _createFbo(texture: WebGLTexture): WebGLFramebuffer {
+    const gl = this._gl;
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D, texture, 0);
+    return fbo;
   }
 
   private _createShaderProgram(vSrc: string, fSrc: string): WebGLProgram {

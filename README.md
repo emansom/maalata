@@ -47,16 +47,16 @@ Four discrete stages model the full path from input device to screen, each with 
 
 Worst-case: **168ms** (8 + 10 + 125 + 25). Average: **~119ms**. GPU queuing latency is handled by canvas-ultrafast's real WebGL triple-buffer FBOs rather than a simulated delay stage.
 
-### Pixel art smoothing (xBRZ Freescale + RGSS)
+### Pixel art smoothing (ScaleFX + sharpsmoother + AA level2 + EWA smooth)
 
 maalata targets 1:1 pixel art — consumers draw at native resolution and get improved visuals automatically, no code changes needed. The library handles all internal upscaling and smoothing transparently.
 
-**Pixel-perfect rendering** — maalata is designed for pixel art canvases. All WebGL textures use `gl.NEAREST` (nearest-neighbor) filtering and the canvas element uses CSS `image-rendering: pixelated`. Together with canvas-ultrafast's `imageSmoothingEnabled: false` default, this eliminates bilinear interpolation at every stage — from WebGL texture sampling through browser compositing.
+**Pixel-perfect rendering** — maalata is designed for pixel art canvases. All WebGL textures use `gl.NEAREST` (nearest-neighbor) filtering and the canvas element uses CSS `image-rendering: pixelated`. Together with canvas-ultrafast's `imageSmoothingEnabled: false` default, this eliminates bilinear interpolation at every stage — from WebGL texture sampling through browser compositing. The WebGL output is always the same size as the canvas input; all internal upscaling is purely in GPU FBOs.
 
-A three-pass pre-processing pipeline smooths pixel art edges using xBRZ Freescale Multipass (Hyllian + Zenju), a perceptual color distance algorithm with dominant gradient detection that produces the smoothest possible edges for pixel art. Pass 0 analyzes a 3×3+extended neighborhood and outputs packed blend metadata; pass 1 reads those decisions and applies smoothstep-based directional blending at 2× scale; RGSS downsamples back to native resolution. Same output resolution as input, vastly better edge quality. Purely algorithmic — no lookup tables or async loading needed.
+A nine-pass pre-processing pipeline smooths pixel art edges using ScaleFX (Sp00kyFox), sharpsmoother (guest(r)), and AA level2 (guest(r)), producing SVG-quality smoothing for pixel art. ScaleFX performs 6-level edge classification with precise slope detection using Compuphase perceptual color distance, outputting at 3× scale. Sharpsmoother adds edge-preserving color blending. AA level2 provides two-pass directional anti-aliasing. An EWA smooth downsample (raised-cosine polar filter, no negative lobes) reduces back to native resolution with maximum smoothness and zero ringing. Same output resolution as input, completely smooth edges with no visible staircase artifacts. Purely algorithmic — no lookup tables or async loading needed.
 
 The smoothing pipeline is implemented as a standalone `SmoothingDisplay` class that can be used in two modes:
-- **With CRT** (`crt: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-2, then applies CRT effects on the smoothed output.
+- **With CRT** (`crt: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-8, then applies CRT effects on the smoothed output.
 - **Standalone** (`crt: false, smoothing: true`): `SmoothingDisplay` runs its own RAF loop and blits smoothed output directly to screen — pixel art edge smoothing without the retro CRT look.
 
 On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pipeline corrects.
@@ -64,41 +64,50 @@ On a real 2002 CRT, pixel art was displayed at native resolution and the analog 
 ```
 Ready Texture (raw pixel art, sRGB, W × H)
     |
-[Pass 0: xBRZ analysis]
-    |  3×3 core + extended neighbors, YCbCr perceptual color distance
-    |  4-corner blend classification (NONE/NORMAL/DOMINANT)
-    |  Shallow/steep line detection, packed as integer metadata (W×H → W×H)
+[Pass 0: ScaleFX metric]
+    |  Compuphase perceptual color distance to 4 neighbors (A,B,C,F)
+    |  Output: RGBA16F distance vector (W×H → W×H)
     |
-Analysis Texture (blend metadata, W × H)
+[Pass 1: ScaleFX strength]
+    |  Corner interpolation strength via edge/threshold comparison
+    |  Reads pass 0 metric, output: RGBA16F (W×H → W×H)
     |
-[Pass 1: xBRZ freescale blend]
-    |  Reads pass0 metadata + original source
-    |  Decodes blend flags, applies directional smoothstep blending
-    |  per corner with shallow/steep line awareness (W×H → 2W×2H)
+[Pass 2: ScaleFX ambiguity]
+    |  Dominance voting, single-pixel detection, edge orientation
+    |  Reads pass 0 metric + pass 1 strength
+    |  Packs: (res + 2*hori + 4*vert + 8*orient) / 15 (W×H → W×H)
     |
-Upscaled Texture (2W × 2H)
+[Pass 3: ScaleFX edge level]
+    |  6-level edge classification (±3 texels), subpixel tag assignment
+    |  Packs: (crn + 9*mid) / 80 (W×H → W×H)
     |
-[Pass 2: RGSS downsample]
-    |  4 rotated grid samples per output pixel (2W×2H → W×H)
+[Pass 4: ScaleFX 3× output]
+    |  Decode tags → map 3×3 subpixel grid → fetch original pixel color
+    |  Reads pass 3 edge level + original input (W×H → 3W×3H)
+    |
+[Pass 5: Sharpsmoother]
+    |  3×3 perceptual-weighted edge-preserving smoothing (3W×3H → 3W×3H)
+    |
+[Pass 6: AA level2 pass 1]
+    |  13-point directional AA (diagonal + horizontal + vertical extended)
+    |  LINEAR texture filtering (3W×3H → 3W×3H)
+    |
+[Pass 7: AA level2 pass 2]
+    |  4-point diagonal AA (half-pixel offset weighted blend)
+    |  LINEAR texture filtering (3W×3H → 3W×3H)
+    |
+[Pass 8: EWA smooth downsample]
+    |  Raised-cosine 8×8 polar downsample, no negative lobes
+    |  SUPPORT=1.5, u_downscaleFactor=3.0 (3W×3H → W×H)
     |
 Smoothed Texture (anti-aliased edges, sRGB, W × H)
     |
-[Pass 3: CRT shader -> Screen]
+[Pass 9: CRT shader -> Screen]
 ```
 
-Total VRAM for the smoothing pipeline is 6 WH (analysis W×H + upscaled 2W×2H + intermediate W×H).
+Total VRAM for the smoothing pipeline is 25 WH (2× RGBA16F W×H + 2× RGBA8 W×H + 2× RGBA8 3W×3H + 1× RGBA8 W×H). Requires `EXT_color_buffer_float` WebGL2 extension (99%+ support).
 
-The RGSS stage uses the same rotated grid pattern as hardware 4× MSAA, with sample offsets at (-3/8,-1/8), (1/8,-3/8), (3/8,1/8), (-1/8,3/8) in output pixel units. This avoids the axis-aligned artifacts of a regular box filter.
-
-Algorithm stages per fragment (xBRZ analysis pass):
-1. **3×3+extended neighborhood sampling** — read core pixels A-I plus extended neighbors up to ±2 offset for each corner
-2. **YCbCr perceptual distance** — `DistYCbCr()` with Rec.2020 luma weights (0.2627, 0.6780, 0.0593), Cb/Cr chroma components
-3. **4-corner blend classification** — for each corner: compare diagonal gradient strengths, classify as BLEND_NONE, BLEND_NORMAL, or BLEND_DOMINANT
-4. **Line blend refinement** — check adjacent corner conflicts, detect smooth runs (G→H→I→F→C), determine if line blending is appropriate
-5. **Shallow/steep line detection** — compare perpendicular gradient strengths against `STEEP_DIRECTION_THRESHOLD` (2.2) to classify diagonal line angles
-6. **Metadata packing** — encode `blendResult + 4*doLineBlend + 16*shallowLine + 64*steepLine` per channel, divide by 255.0 for RGBA8 storage
-
-Pass 1 operates at 2× output resolution. For each output fragment: decode packed metadata from pass 0, read 5 original pixels (B, D, E, F, H), then for each active corner compute `get_left_ratio()` — the signed distance from the sub-pixel position to the directional blend line, smoothed through `smoothstep(-√2/2, √2/2, v)`. The blend pixel is chosen as the perceptually-closer neighbor (via `DistYCbCr`). Shallow/steep flags adjust the blend line origin and direction for better diagonal handling.
+The EWA smooth downsample uses a raised-cosine envelope with polar distance — no negative lobes means zero ringing and maximum smoothness. 8×8 grid (64 taps), SUPPORT=1.5 output pixel radius. At `u_downscaleFactor=3.0` (main pipeline): halfScale=1.5, support extends to 2.25 source texels from center, ~32 of 64 samples contribute. At `u_downscaleFactor=1.5` (for `screenshotUpscaled()` 3×→2×): halfScale=0.75, ~16 of 64 samples contribute. The kernel adapts automatically via `u_downscaleFactor`.
 
 ### CRT post-processing
 
@@ -184,7 +193,7 @@ renderer.destroy();
 | `getCanvasSize()` | Return `{ width, height }` |
 | `on(event, callback)` | Subscribe to lifecycle events; returns unsubscribe function |
 | `screenshot()` | Capture current CRT-processed frame as `ImageBitmap` |
-| `screenshotUpscaled()` | Capture xBRZ 2× upscaled texture (before RGSS) as `ImageBitmap`, or `null` |
+| `screenshotUpscaled()` | Capture xBRZ upscaled texture as GPU-downsampled 2× `ImageBitmap`, or `null` |
 | `ready()` | `Promise<void>` that resolves when the renderer is initialized |
 | `destroy()` | Release all WebGL resources and detach listeners |
 
@@ -215,9 +224,10 @@ The combined fragment shader draws from three MIT-licensed implementations:
 
 ### Pixel art smoothing
 
-- **Hyllian** (2011/2016) — xBR-vertex code and texel mapping (MIT)
-- **Zenju** — xBRZ algorithm concepts from HqMAME/Desmume (GPL-3.0): YCbCr perceptual distance, dominant gradient detection, shallow/steep line classification
-- **[libretro/glsl-shaders](https://github.com/libretro/glsl-shaders/tree/master/xbrz/shaders/xbrz-freescale-multipass)** (MIT + GPL-3.0) — GLSL reference implementation of xBRZ Freescale Multipass (pass0 analysis + pass1 blend) adapted for the maalata smoothing pipeline
+- **Sp00kyFox** (2016-2017) — ScaleFX edge interpolation specialized in pixel art (MIT): 6-level edge classification, Compuphase perceptual color distance, subpixel tag assignment
+- **guest(r)** (2005-2017) — Sharpsmoother edge-preserving color smoothing (GPL v2+), AA Shader 4.0 Level2 directional anti-aliasing (GPL v2+)
+- **[libretro/glsl-shaders](https://github.com/libretro/glsl-shaders)** — GLSL reference implementations: [ScaleFX](https://github.com/libretro/glsl-shaders/tree/master/edge-smoothing/scalefx) (MIT), [sharpsmoother](https://github.com/libretro/glsl-shaders/blob/master/blurs/shaders/sharpsmoother.glsl) (GPL v2+), [aa-shader-4.0-level2](https://github.com/libretro/glsl-shaders/tree/master/anti-aliasing/shaders/aa-shader-4.0-level2) (GPL v2+)
+- **Compuphase** — [Perceptual color distance metric](http://www.compuphase.com/cmetric.htm) used by ScaleFX
 
 ### Rendering backend
 

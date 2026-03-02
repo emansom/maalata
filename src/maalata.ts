@@ -179,8 +179,9 @@ export class CanvasRenderer {
   }
 
   /**
-   * Capture the 2W×2H xBRZ Freescale upscaled texture (before RGSS downsample)
-   * as an ImageBitmap. Returns null if no smoothing/CRT display is active.
+   * Capture the ScaleFX+AA upscaled texture as a GPU-downsampled 2W×2H
+   * ImageBitmap (3W×3H internal → 2W×2H via EWA smooth downsample).
+   * Returns null if no smoothing/CRT display is active.
    */
   public async screenshotUpscaled(): Promise<ImageBitmap | null> {
     if (this._smoothingDisplay) return this._smoothingDisplay.screenshotUpscaled();

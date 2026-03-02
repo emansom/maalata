@@ -5,12 +5,12 @@
  * Reads from UltrafastRenderer's ready texture and applies two-stage
  * rendering before blitting to the default framebuffer:
  *
- *   Stage 1: SmoothingDisplay (passes 0-2) — xBRZ analysis → xBRZ freescale blend → RGSS downsample
+ *   Stage 1: SmoothingDisplay (passes 0-8) — ScaleFX → sharpsmoother → AA level2 → EWA smooth downsample
  *   Stage 2: CRT shader → screen (W×H, 12-step effects pipeline)
  *
- * Smoothing is delegated to SmoothingDisplay, which owns the xBRZ analysis,
- * blend, and downsample resources. CRTDisplay reads the smoothed texture
- * via getSmoothedTexture().
+ * Smoothing is delegated to SmoothingDisplay, which owns the ScaleFX,
+ * sharpsmoother, AA, and EWA downsample resources. CRTDisplay reads the
+ * smoothed texture via getSmoothedTexture().
  *
  * Bypass: _inputSize: [0, 0] skips smoothing — CRT reads raw ready texture.
  *
@@ -274,8 +274,8 @@ export class CRTDisplay {
   }
 
   /**
-   * Read the 2W×2H upscaled FBO (xBRZ freescale output before RGSS downsample).
-   * Delegates to the internal SmoothingDisplay.
+   * GPU-downsample the 3W×3H post-AA FBO to 2W×2H using the EWA smooth
+   * downsample shader. Delegates to the internal SmoothingDisplay.
    */
   async screenshotUpscaled(): Promise<ImageBitmap> {
     return this._smoothing.screenshotUpscaled();

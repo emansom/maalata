@@ -1,10 +1,10 @@
 /**
- * Smoothing Demo — Comparison of raw, xBRZ+RGSS smoothed, and xBRZ-only pixel art.
+ * Smoothing Demo — Comparison of raw, ScaleFX+EWA smoothed, and ScaleFX+AA pixel art.
  *
  * Three canvases:
  * - Raw (400×400): passthrough rendering, no smoothing
- * - Smoothed (400×400): xBRZ analysis → xBRZ freescale blend → RGSS downsample
- * - xBRZ only (800×800): xBRZ freescale 2× upscale at native resolution (no RGSS)
+ * - Smoothed (400×400): ScaleFX 5-pass → sharpsmoother → AA level2 → EWA smooth downsample
+ * - ScaleFX+AA (800×800): ScaleFX+sharpsmoother+AA at 3×, GPU-downsampled to 2× via EWA smooth
  *
  * Draws a Habbo avatar at its native 1:1 pixel size (128×220), centered on
  * the canvas. maalata targets 1:1 pixel art — consumers draw at native
