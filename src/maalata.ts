@@ -1,12 +1,19 @@
 /**
  * Maalata — "2002 era" Retro Canvas Experience
  *
- * Pixel art canvas renderer. Combines canvas-ultrafast's WebGL Canvas 2D
- * renderer with:
+ * Pixel art canvas renderer with display state machine. Combines
+ * canvas-ultrafast's WebGL Canvas 2D renderer with:
  * - NEAREST texture filtering + CSS image-rendering: pixelated (no smoothing)
  * - 4-stage click-to-photon latency pipeline (168ms worst-case)
+ * - Pixel art smoothing (ScaleFX + sharpsmoother + AA level2 + EWA smooth)
  * - CRT post-processing shader (barrel distortion, scanlines, etc.)
  * - 60s idle shutdown with transparent restart
+ *
+ * Renderer stack priority: BFI > CRT > Smoothing > Passthrough.
+ * Exactly one requestAnimationFrame loop runs at any given time.
+ * Smoothing and CRT are independently toggleable — both via RendererConfig
+ * (initial state) and runtime methods (setSmoothing(), setCRT()).
+ * All CRT shader effects are additionally toggleable via updateCRTConfig().
  */
 
 import { UltrafastRenderer, CanvasAPI, parseColor, type CanvasCommand } from 'canvas-ultrafast';
@@ -19,11 +26,11 @@ export { type CRTConfig } from './crt-display';
 
 export interface RendererConfig {
   canvas: HTMLCanvasElement;
-  /** Enable CRT post-processing filter. Default: true */
+  /** Enable CRT post-processing filter. Default: true. Toggleable at runtime via setCRT(). */
   crt?: boolean;
   /** CRT filter parameters. Only used when crt is enabled. */
   crtConfig?: Partial<CRTConfig>;
-  /** Enable pixel art smoothing when CRT is disabled. Default: false */
+  /** Enable pixel art smoothing. Default: true. Toggleable at runtime via setSmoothing(). */
   smoothing?: boolean;
   /** Explicit background color (CSS string). If omitted, auto-detected from DOM. */
   backgroundColor?: string;
@@ -36,7 +43,17 @@ export type RendererEvent =
   | { type: 'suspending'; done: () => void }
   | { type: 'canvas-replacing'; done: () => void };
 
-type RendererState = 'active' | 'suspended' | 'starting';
+/**
+ * Display state machine — governs RAF ownership and display mode.
+ * Exactly one requestAnimationFrame loop runs at any given time.
+ * Priority: CRTDisplay > SmoothingDisplay > UltrafastRenderer passthrough.
+ */
+type DisplayState =
+  | 'crt+smoothing'   // CRTDisplay RAF, smoothing delegate active
+  | 'crt-only'        // CRTDisplay RAF, no smoothing
+  | 'smoothing-only'  // SmoothingDisplay RAF
+  | 'passthrough'     // UltrafastRenderer passthrough
+  | 'suspended';      // No RAF (idle shutdown)
 
 export class CanvasRenderer {
   private _canvas: HTMLCanvasElement;
@@ -44,6 +61,8 @@ export class CanvasRenderer {
   private _crtDisplay: CRTDisplay | null = null;
   private _smoothingDisplay: SmoothingDisplay | null = null;
   private _crtEnabled: boolean;
+  private _smoothingEnabled: boolean;
+  private _crtConfig?: Partial<CRTConfig>;
   private _canvasAPI: CanvasAPI;
   private _eventListeners: Map<string, Set<(event: RendererEvent) => void>> = new Map();
   private _initPromise: Promise<void>;
@@ -55,13 +74,13 @@ export class CanvasRenderer {
   // Last submitted batch (for visibility change replay)
   private _lastBatch: CanvasCommand[] = [];
 
-  // Idle shutdown state machine
-  private _state: RendererState = 'active';
+  // Display state machine
+  private _displayState: DisplayState = 'suspended';
   private _idleTimer: number | null = null;
   private readonly _IDLE_TIMEOUT_MS = 60_000;
 
   private _boundActivityHandler = (): void => {
-    if (this._state === 'active') this._resetIdleTimer();
+    if (this._displayState !== 'suspended') this._resetIdleTimer();
   };
 
   private _boundVisibilityHandler = (): void => {
@@ -74,6 +93,8 @@ export class CanvasRenderer {
   constructor(config: RendererConfig) {
     this._canvas = config.canvas;
     this._crtEnabled = config.crt ?? true;
+    this._smoothingEnabled = config.smoothing ?? true;
+    this._crtConfig = config.crtConfig;
 
     // Create UltrafastRenderer on the user's canvas
     this._renderer = new UltrafastRenderer(this._canvas);
@@ -93,30 +114,8 @@ export class CanvasRenderer {
       this._renderer.setBackgroundColor(c[0], c[1], c[2]);
     }
 
-    // Set up CRT, smoothing, or passthrough display
-    if (this._crtEnabled) {
-      const [bgR, bgG, bgB] = this._renderer.getBackgroundColor();
-      this._crtDisplay = new CRTDisplay(
-        this._renderer.getGL(),
-        this._canvas,
-        () => this._renderer.getReadyTexture(),
-        () => this._hasContent,
-        config.crtConfig,
-      );
-      this._crtDisplay.setBgColor(bgR, bgG, bgB);
-      this._crtDisplay.start();
-    } else if (config.smoothing) {
-      this._smoothingDisplay = new SmoothingDisplay(
-        this._renderer.getGL(),
-        this._canvas,
-        () => this._renderer.getReadyTexture(),
-        () => this._hasContent,
-      );
-      this._smoothingDisplay.start();
-    } else {
-      // No CRT, no smoothing — restart the passthrough display
-      this._renderer.startDisplay();
-    }
+    // Transition to the derived display mode
+    this._transitionTo(this._deriveMode());
 
     // Build the 4-stage latency pipeline
     this._buildPipeline();
@@ -125,7 +124,7 @@ export class CanvasRenderer {
     this._attachActivityListeners(this._canvas);
     document.addEventListener('visibilitychange', this._boundVisibilityHandler);
 
-    // xBR smoothing is purely algorithmic — no async loading needed.
+    // Smoothing is purely algorithmic — no async loading needed.
     // ready() resolves immediately (backwards-compatible for consumers that await it).
     this._initPromise = Promise.resolve();
     this._resetIdleTimer();
@@ -179,21 +178,54 @@ export class CanvasRenderer {
   }
 
   /**
+   * Toggle pixel art smoothing at runtime. Lazy-creates SmoothingDisplay on
+   * first enable. When CRT is active, updates the smoothing delegate
+   * reference (no RAF change); when CRT is off, swaps between smoothing
+   * RAF and passthrough.
+   */
+  public setSmoothing(enabled: boolean): void {
+    if (enabled === this._smoothingEnabled) return;
+    this._smoothingEnabled = enabled;
+    if (this._displayState !== 'suspended') {
+      this._transitionTo(this._deriveMode());
+    }
+  }
+
+  /**
+   * Toggle CRT post-processing at runtime. Lazy-creates CRTDisplay on first
+   * enable. Uses stop-before-start RAF switching. BFI reactivates with Hz
+   * re-calibration on re-enable.
+   */
+  public setCRT(enabled: boolean): void {
+    if (enabled === this._crtEnabled) return;
+    this._crtEnabled = enabled;
+    if (this._displayState !== 'suspended') {
+      this._transitionTo(this._deriveMode());
+    }
+  }
+
+  /**
    * Capture the ScaleFX+AA upscaled texture as a GPU-downsampled 2W×2H
    * ImageBitmap (3W×3H internal → 2W×2H via EWA smooth downsample).
-   * Returns null if no smoothing/CRT display is active.
+   * Returns null if smoothing is disabled.
    */
   public async screenshotUpscaled(): Promise<ImageBitmap | null> {
-    if (this._smoothingDisplay) return this._smoothingDisplay.screenshotUpscaled();
-    if (this._crtDisplay) return this._crtDisplay.screenshotUpscaled();
+    if (this._smoothingEnabled && this._smoothingDisplay) {
+      return this._smoothingDisplay.screenshotUpscaled();
+    }
     return null;
   }
 
   public screenshot(): Promise<ImageBitmap> {
-    // Trigger a synchronous render so the canvas has the latest frame
-    if (this._crtDisplay) {
+    // Force a synchronous render so the canvas has the latest frame.
+    // Works in any display state including suspended — sync smoothing
+    // delegate to match current _smoothingEnabled flag before rendering.
+    if (this._crtEnabled && this._crtDisplay) {
+      this._crtDisplay.setSmoothing(
+        this._smoothingEnabled && this._smoothingDisplay ? this._smoothingDisplay : null
+      );
       this._crtDisplay.render();
-    } else if (this._smoothingDisplay) {
+    } else if (this._smoothingEnabled && this._smoothingDisplay) {
       this._smoothingDisplay.render();
     }
     // Ensure all GL commands complete before reading the canvas buffer.
@@ -212,6 +244,8 @@ export class CanvasRenderer {
     this._detachActivityListeners(this._canvas);
     this._cancelIdleTimer();
     this._destroyPipeline();
+    // Exit current state (stop any active RAF)
+    this._exitState(this._displayState);
     if (this._crtDisplay) {
       this._crtDisplay.destroy();
       this._crtDisplay = null;
@@ -221,8 +255,97 @@ export class CanvasRenderer {
       this._smoothingDisplay = null;
     }
     this._renderer.destroy();
-    this._state = 'suspended';
+    this._displayState = 'suspended';
     this._eventListeners.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: display state machine
+  // -------------------------------------------------------------------------
+
+  /** Derive the target display mode from current feature flags. */
+  private _deriveMode(): DisplayState {
+    if (this._crtEnabled && this._smoothingEnabled) return 'crt+smoothing';
+    if (this._crtEnabled) return 'crt-only';
+    if (this._smoothingEnabled) return 'smoothing-only';
+    return 'passthrough';
+  }
+
+  /** Transition between display states — stop-before-start guarantees no duplicate RAF loops. */
+  private _transitionTo(newState: DisplayState): void {
+    if (this._displayState === newState) return;
+    this._exitState(this._displayState);
+    this._enterState(newState);
+    this._displayState = newState;
+  }
+
+  /** Exit a display state (stop RAF / passthrough). */
+  private _exitState(state: DisplayState): void {
+    switch (state) {
+      case 'crt+smoothing':
+      case 'crt-only':
+        this._crtDisplay!.stop();
+        break;
+      case 'smoothing-only':
+        this._smoothingDisplay!.stop();
+        break;
+      case 'passthrough':
+        this._renderer.stopDisplay();
+        break;
+      case 'suspended':
+        break;
+    }
+  }
+
+  /** Enter a display state (start RAF / passthrough). */
+  private _enterState(state: DisplayState): void {
+    switch (state) {
+      case 'crt+smoothing':
+        this._ensureSmoothingDisplay();
+        this._ensureCRTDisplay();
+        this._crtDisplay!.setSmoothing(this._smoothingDisplay!);
+        this._crtDisplay!.start();
+        break;
+      case 'crt-only':
+        this._ensureCRTDisplay();
+        this._crtDisplay!.setSmoothing(null);
+        this._crtDisplay!.start();
+        break;
+      case 'smoothing-only':
+        this._ensureSmoothingDisplay();
+        this._smoothingDisplay!.start();
+        break;
+      case 'passthrough':
+        this._renderer.startDisplay();
+        break;
+      case 'suspended':
+        break;
+    }
+  }
+
+  /** Create SmoothingDisplay on first need, kept alive until destroy(). */
+  private _ensureSmoothingDisplay(): void {
+    if (this._smoothingDisplay) return;
+    this._smoothingDisplay = new SmoothingDisplay(
+      this._renderer.getGL(),
+      this._canvas,
+      () => this._renderer.getReadyTexture(),
+      () => this._hasContent,
+    );
+  }
+
+  /** Create CRTDisplay on first need, kept alive until destroy(). */
+  private _ensureCRTDisplay(): void {
+    if (this._crtDisplay) return;
+    this._crtDisplay = new CRTDisplay(
+      this._renderer.getGL(),
+      this._canvas,
+      () => this._renderer.getReadyTexture(),
+      () => this._hasContent,
+      this._crtConfig,
+    );
+    const [bgR, bgG, bgB] = this._renderer.getBackgroundColor();
+    this._crtDisplay.setBgColor(bgR, bgG, bgB);
   }
 
   // -------------------------------------------------------------------------
@@ -288,42 +411,25 @@ export class CanvasRenderer {
   }
 
   private async _suspend(): Promise<void> {
-    if (this._state !== 'active') return;
+    if (this._displayState === 'suspended') return;
     this._cancelIdleTimer();
     await this._dispatchAwaited('suspending');
-    if (this._crtDisplay) {
-      this._crtDisplay.stop();
-    } else if (this._smoothingDisplay) {
-      this._smoothingDisplay.stop();
-    } else {
-      this._renderer.stopDisplay();
-    }
-    this._state = 'suspended';
+    this._transitionTo('suspended');
   }
 
   private _ensureActive(): void {
-    if (this._state === 'active') return;
+    if (this._displayState !== 'suspended') return;
 
-    if (this._state === 'suspended') {
-      this._state = 'starting';
-      this._dispatchEvent({ type: 'resuming' });
+    this._dispatchEvent({ type: 'resuming' });
 
-      // Backward-compatible no-op events
-      this._dispatchEvent({ type: 'canvas-replacing', done: () => {} } as RendererEvent);
+    // Backward-compatible no-op events
+    this._dispatchEvent({ type: 'canvas-replacing', done: () => {} } as RendererEvent);
 
-      if (this._crtDisplay) {
-        this._crtDisplay.start();
-      } else if (this._smoothingDisplay) {
-        this._smoothingDisplay.start();
-      } else {
-        this._renderer.startDisplay();
-      }
-      this._state = 'active';
-      this._resetIdleTimer();
+    this._transitionTo(this._deriveMode());
+    this._resetIdleTimer();
 
-      this._dispatchEvent({ type: 'ready' });
-      this._dispatchEvent({ type: 'canvas-replaced', canvas: this.getCanvas() });
-    }
+    this._dispatchEvent({ type: 'ready' });
+    this._dispatchEvent({ type: 'canvas-replaced', canvas: this.getCanvas() });
   }
 
   // -------------------------------------------------------------------------

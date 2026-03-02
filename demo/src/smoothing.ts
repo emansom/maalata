@@ -20,7 +20,7 @@ const canvasXbrz = document.getElementById('canvas-xbrz') as HTMLCanvasElement;
 if (!canvasRaw || !canvasSmooth || !canvasXbrz) throw new Error('Canvas elements not found');
 
 async function initializeDemo() {
-  const rendererRaw = new CanvasRenderer({ canvas: canvasRaw, crt: false });
+  const rendererRaw = new CanvasRenderer({ canvas: canvasRaw, crt: false, smoothing: false });
   const rendererSmooth = new CanvasRenderer({ canvas: canvasSmooth, crt: false, smoothing: true });
 
   const ctxRaw = rendererRaw.getCanvasAPI();

@@ -419,6 +419,14 @@ async function main() {
     // Keep renderer alive — hover resets the 60s idle timer
     await canvas.hover({ position: { x: 400, y: 200 } });
 
+    // --- Unit tests: disable smoothing for clean CRT-only measurements ---
+    // Smoothing defaults to true; disable for isolated CRT shader testing.
+    // setSmoothing() updates _smoothingEnabled; screenshot() syncs the CRT
+    // delegate before rendering, so this works even in suspended state.
+    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+    await page.evaluate(() => window.maalataRenderer.setSmoothing(false));
+    /* eslint-enable no-undef */
+
     // --- Unit test: Passthrough (neutral config) ---
     // Test pattern is already on the ready texture from "Test Pattern" button.
     // Switch to neutral config and verify white bar ≈ 255.
@@ -536,6 +544,65 @@ async function main() {
         const msg = `[Unit desaturation] Red bar R=${color.r.toFixed(0)} G=${color.g.toFixed(0)} B=${color.b.toFixed(0)}, expected ≈ (166, 38, 38) ±20`;
         errors.push(msg);
         console.error(`${tag} ${msg}`);
+      }
+    }
+
+    // Re-enable smoothing after unit tests
+    /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+    await page.evaluate(() => window.maalataRenderer.setSmoothing(true));
+    /* eslint-enable no-undef */
+
+    // --- Unit test: BFI activation at simulated 120Hz ---
+    console.log(`\n${tag} Unit: BFI activation at simulated 120Hz...`);
+    {
+      // Enable BFI config
+      await applyConfig(page, { ...NEUTRAL_CRT, bfiStrength: 0.5, bfiTargetHz: 60 });
+
+      /* eslint-disable no-undef -- callback runs inside Playwright browser context */
+      const bfiResult = await page.evaluate(async () => {
+        const renderer = window.maalataRenderer;
+        const crt = renderer._crtDisplay;
+
+        // Stop real RAF loop — we'll drive frames manually
+        crt.stop();
+
+        // Shim performance.now with manual time advancement (no auto-increment).
+        // render() also calls performance.now() for u_time uniform — manual control
+        // prevents double-advancing the simulated clock.
+        let simTime = 1000;
+        const realNow = performance.now.bind(performance);
+        performance.now = () => simTime;
+
+        // Drive 50 frames to converge EMA (~20 frames at alpha=0.05)
+        for (let i = 0; i < 50; i++) {
+          simTime += 8.33; // advance 8.33ms (120Hz interval)
+          crt._frameCount = (crt._frameCount + 1) % 100000;
+          crt._updateHz();
+        }
+
+        const result = {
+          bfiActive: crt._bfiActive,
+          measuredHz: crt._measuredHz,
+          historyInitialized: crt._historyInitialized,
+        };
+
+        // Restore real performance.now and restart RAF
+        performance.now = realNow;
+        crt.start();
+        return result;
+      });
+      /* eslint-enable no-undef */
+
+      console.log(`${tag}   BFI active: ${bfiResult.bfiActive}, Hz: ${bfiResult.measuredHz.toFixed(1)}, history: ${bfiResult.historyInitialized}`);
+
+      if (!bfiResult.bfiActive) {
+        errors.push('[Unit BFI] BFI should be active at simulated 120Hz');
+      }
+      if (bfiResult.measuredHz < 110) {
+        errors.push(`[Unit BFI] Measured Hz ${bfiResult.measuredHz.toFixed(1)} < 110`);
+      }
+      if (!bfiResult.historyInitialized) {
+        errors.push('[Unit BFI] History textures should be initialized');
       }
     }
 

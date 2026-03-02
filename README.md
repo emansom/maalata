@@ -55,8 +55,8 @@ maalata targets 1:1 pixel art — consumers draw at native resolution and get im
 
 A nine-pass pre-processing pipeline smooths pixel art edges using ScaleFX (Sp00kyFox), sharpsmoother (guest(r)), and AA level2 (guest(r)), producing SVG-quality smoothing for pixel art. ScaleFX performs 6-level edge classification with precise slope detection using Compuphase perceptual color distance, outputting at 3× scale. Sharpsmoother adds edge-preserving color blending. AA level2 provides two-pass directional anti-aliasing. An EWA smooth downsample (raised-cosine polar filter, no negative lobes) reduces back to native resolution with maximum smoothness and zero ringing. Same output resolution as input, completely smooth edges with no visible staircase artifacts. Purely algorithmic — no lookup tables or async loading needed.
 
-The smoothing pipeline is implemented as a standalone `SmoothingDisplay` class that can be used in two modes:
-- **With CRT** (`crt: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-8, then applies CRT effects on the smoothed output.
+The smoothing pipeline is implemented as a standalone `SmoothingDisplay` class that can be used in two modes, both configurable at init and toggleable at runtime:
+- **With CRT** (`crt: true, smoothing: true`): `CRTDisplay` delegates to `SmoothingDisplay` for passes 0-8, then applies CRT effects on the smoothed output.
 - **Standalone** (`crt: false, smoothing: true`): `SmoothingDisplay` runs its own RAF loop and blits smoothed output directly to screen — pixel art edge smoothing without the retro CRT look.
 
 On a real 2002 CRT, pixel art was displayed at native resolution and the analog beam naturally softened edges — the pre-upscaling is an artifact of the modern web canvas that this pipeline corrects.
@@ -132,29 +132,62 @@ Every effect block is guarded by a `> 0.0001` threshold check for early-out when
 
 **Colorspace pipeline** — The shader simulates a 2002-era PC CRT monitor on a modern sRGB display. Input is sRGB-encoded (from Canvas 2D API via WebGL RGBA textures — no hardware sRGB conversion). The shader decodes with CRT gamma (γ=2.4, BT.1886 standard for CRT phosphor response), processes physical effects in linear space, then re-encodes with sRGB gamma (γ=2.2). The net gamma of 2.4/2.2 ≈ 1.09 produces the subtle contrast boost characteristic of CRT viewing — midtones render slightly darker, matching what users experienced on real CRT monitors in 2002. No color primary conversion is needed: PC CRT P22 phosphors had primaries nearly identical to sRGB/Rec.709 (unlike TV NTSC/PAL standards which require matrix conversion).
 
-**Black Frame Insertion (BFI)** — On displays running at 120Hz+, a rolling scan simulates CRT phosphor decay using a 3-frame trailing buffer. Hz detection uses an EMA-smoothed `requestAnimationFrame` delta with hysteresis (activate at 120Hz, deactivate below 110Hz). Per-channel overlap intervals and gamma-correct blending prevent banding artifacts.
+**Black Frame Insertion (BFI)** — On displays running at 120Hz+, a rolling scan simulates CRT phosphor decay using a 3-frame trailing buffer. Hz detection uses an EMA-smoothed `requestAnimationFrame` delta with hysteresis (activate at 120Hz, deactivate below 110Hz). Per-channel overlap intervals and gamma-correct blending prevent banding artifacts. BFI has the highest priority in the renderer stack — CRTDisplay owns the RAF loop whenever CRT is enabled, ensuring BFI Hz detection, frame capture, and rolling scan operate at full RAF cadence unaffected by smoothing state or other feature toggles.
+
+### Feature toggles
+
+All features are independently toggleable via `RendererConfig` (initial state) and runtime methods (`setSmoothing()`, `setCRT()`, `updateCRTConfig()`).
+
+| Feature | Config | Runtime | Notes |
+|---------|--------|---------|-------|
+| Pixel art smoothing | `smoothing: true` | `setSmoothing(bool)` | Lazy-created on first enable |
+| CRT post-processing | `crt: true` | `setCRT(bool)` | Lazy-created on first enable |
+| Individual CRT effects | `crtConfig: { ... }` | `updateCRTConfig({ ... })` | Early-out when ≤ 0.0001 |
+| BFI | `crtConfig: { bfiStrength }` | `updateCRTConfig({ bfiStrength })` | Highest priority, auto Hz detection |
+
+Exactly one `requestAnimationFrame` loop runs at any time. CRTDisplay owns the loop when CRT is enabled (calling smoothing synchronously); SmoothingDisplay owns it when CRT is off; UltrafastRenderer passthrough runs when both are off.
 
 ## API overview
 
 ```ts
 import { CanvasRenderer } from 'maalata';
 
-// Full CRT experience (smoothing included automatically)
+// Full experience (default) — smoothing + CRT + BFI
 const renderer = new CanvasRenderer({
   canvas: document.getElementById('canvas') as HTMLCanvasElement,
   crt: true,
+  smoothing: true,
   crtConfig: {
     chromaticAberration: 0.0005,
     flicker: 0.02,
   },
 });
 
-// Smoothing only (no CRT effects) — pixel art edge smoothing without retro look
+// CRT only (no smoothing) — raw pixels through CRT shader
+const crtRenderer = new CanvasRenderer({
+  canvas: document.getElementById('canvas') as HTMLCanvasElement,
+  crt: true,
+  smoothing: false,
+});
+
+// Smoothing only (no CRT) — anti-aliased edges, no retro effects
 const smoothRenderer = new CanvasRenderer({
   canvas: document.getElementById('canvas') as HTMLCanvasElement,
   crt: false,
   smoothing: true,
 });
+
+// Passthrough — raw pixel art, no processing
+const rawRenderer = new CanvasRenderer({
+  canvas: document.getElementById('canvas') as HTMLCanvasElement,
+  crt: false,
+  smoothing: false,
+});
+
+// Runtime toggling
+renderer.setSmoothing(false);  // disable smoothing
+renderer.setCRT(false);        // disable CRT
+renderer.setSmoothing(true);   // re-enable smoothing
 
 // Canvas 2D-compatible drawing API (provided by canvas-ultrafast)
 const ctx = renderer.getCanvasAPI();
@@ -181,7 +214,7 @@ renderer.destroy();
 | `CanvasRenderer` | Latency pipeline + CRT display + idle lifecycle |
 | `CanvasAPI` | Canvas 2D-compatible command recording (re-exported from canvas-ultrafast) |
 | `CRTConfig` | All CRT shader parameters (barrel, pixel beam, BFI, etc.) |
-| `RendererConfig` | Constructor options (canvas, crt toggle, smoothing toggle, CRT config) |
+| `RendererConfig` | Constructor options (canvas, crt toggle, smoothing toggle, CRT config). Both `crt` and `smoothing` default to `true` and are independently toggleable at runtime. |
 | `RendererEvent` | Union type for lifecycle events |
 
 ### CanvasRenderer methods
@@ -192,8 +225,10 @@ renderer.destroy();
 | `getCanvas()` | Return the active `<canvas>` element |
 | `getCanvasSize()` | Return `{ width, height }` |
 | `on(event, callback)` | Subscribe to lifecycle events; returns unsubscribe function |
+| `setSmoothing(enabled)` | Toggle pixel art smoothing at runtime |
+| `setCRT(enabled)` | Toggle CRT post-processing at runtime |
 | `screenshot()` | Capture current CRT-processed frame as `ImageBitmap` |
-| `screenshotUpscaled()` | Capture xBRZ upscaled texture as GPU-downsampled 2× `ImageBitmap`, or `null` |
+| `screenshotUpscaled()` | Capture ScaleFX+AA upscaled texture as GPU-downsampled 2× `ImageBitmap`, or `null` if smoothing is disabled |
 | `ready()` | `Promise<void>` that resolves when the renderer is initialized |
 | `destroy()` | Release all WebGL resources and detach listeners |
 

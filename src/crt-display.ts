@@ -1,18 +1,20 @@
 /**
  * CRT Display — Post-processing overlay for the "2002 era" experience.
  *
- * Takes ownership of the display loop on a shared WebGL2 context.
- * Reads from UltrafastRenderer's ready texture and applies two-stage
- * rendering before blitting to the default framebuffer:
+ * Owns the RAF loop whenever CRT is enabled. Reads from UltrafastRenderer's
+ * ready texture and applies CRT effects before blitting to screen.
  *
- *   Stage 1: SmoothingDisplay (passes 0-8) — ScaleFX → sharpsmoother → AA level2 → EWA smooth downsample
+ * BFI has the highest priority in the renderer stack. CRTDisplay owns the
+ * RAF loop whenever CRT is enabled, ensuring BFI Hz detection, frame capture,
+ * and rolling scan operate at full RAF cadence regardless of smoothing state.
+ *
+ * Smoothing is an optional borrowed reference — CRTDisplay does not create
+ * or destroy it. When a SmoothingDisplay is set via setSmoothing(), CRT
+ * calls renderSmoothing() synchronously before the CRT shader and reads
+ * the smoothed texture. When null, CRT reads the raw ready texture directly.
+ *
+ *   Stage 1 (optional): SmoothingDisplay (passes 0-8) — ScaleFX → sharpsmoother → AA level2 → EWA smooth downsample
  *   Stage 2: CRT shader → screen (W×H, 12-step effects pipeline)
- *
- * Smoothing is delegated to SmoothingDisplay, which owns the ScaleFX,
- * sharpsmoother, AA, and EWA downsample resources. CRTDisplay reads the
- * smoothed texture via getSmoothedTexture().
- *
- * Bypass: _inputSize: [0, 0] skips smoothing — CRT reads raw ready texture.
  *
  * Shader lineage:
  * - Ichiaka/CRTFilter (MIT) — original effects pipeline
@@ -126,8 +128,8 @@ export class CRTDisplay {
   // Source FBO for BFI frame capture (reads from smoothed or raw texture)
   private _srcFbo: WebGLFramebuffer;
 
-  // Smoothing pipeline delegate
-  private _smoothing: SmoothingDisplay;
+  // Smoothing pipeline delegate (borrowed reference, not owned)
+  private _smoothing: SmoothingDisplay | null = null;
 
   constructor(
     gl: WebGL2RenderingContext,
@@ -135,14 +137,15 @@ export class CRTDisplay {
     getReadyTexture: () => WebGLTexture,
     hasContent: () => boolean,
     config?: Partial<CRTConfig>,
+    smoothing?: SmoothingDisplay | null,
   ) {
     this._gl = gl;
     this._canvas = canvas;
     this._getReadyTexture = getReadyTexture;
     this._hasContent = hasContent;
 
-    // Create smoothing pipeline delegate
-    this._smoothing = new SmoothingDisplay(gl, canvas, getReadyTexture, hasContent);
+    // Borrowed smoothing reference (created and owned by CanvasRenderer)
+    this._smoothing = smoothing ?? null;
 
     // Create CRT shader program
     this._program = this._createShaderProgram(CRT_VERTEX_SRC, CRT_FRAGMENT_SRC);
@@ -173,10 +176,10 @@ export class CRTDisplay {
 
     const gl = this._gl;
     const u = this._uniforms;
-    const smoothingActive = !this._inputSizeOverride || this._inputSizeOverride[1] > 0;
+    const smoothingActive = this._smoothing !== null;
 
     if (smoothingActive) {
-      this._smoothing.renderSmoothing();
+      this._smoothing!.renderSmoothing();
     }
 
     // BFI: detect cycle boundary, capture frame, bind history, set uniforms
@@ -207,7 +210,7 @@ export class CRTDisplay {
     // Bind input texture: smoothed intermediate or raw ready texture
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D,
-      smoothingActive ? this._smoothing.getSmoothedTexture() : this._getReadyTexture()
+      smoothingActive ? this._smoothing!.getSmoothedTexture() : this._getReadyTexture()
     );
 
     // Use CRT program
@@ -274,11 +277,20 @@ export class CRTDisplay {
   }
 
   /**
-   * GPU-downsample the 3W×3H post-AA FBO to 2W×2H using the EWA smooth
-   * downsample shader. Delegates to the internal SmoothingDisplay.
+   * Set or clear the smoothing delegate. Updates the texture source for the
+   * next render frame — BFI frame capture adapts automatically (captures
+   * from smoothed texture when active, raw ready texture when null).
    */
-  async screenshotUpscaled(): Promise<ImageBitmap> {
-    return this._smoothing.screenshotUpscaled();
+  setSmoothing(smoothing: SmoothingDisplay | null): void {
+    this._smoothing = smoothing;
+  }
+
+  /**
+   * GPU-downsample the 3W×3H post-AA FBO to 2W×2H using the EWA smooth
+   * downsample shader. Returns null when no smoothing delegate is set.
+   */
+  async screenshotUpscaled(): Promise<ImageBitmap | null> {
+    return this._smoothing ? this._smoothing.screenshotUpscaled() : null;
   }
 
   /** Clean up resources. */
@@ -289,8 +301,8 @@ export class CRTDisplay {
     gl.deleteBuffer(this._quadVBO);
     gl.deleteFramebuffer(this._srcFbo);
 
-    // Delegate smoothing cleanup
-    this._smoothing.destroy();
+    // Clear borrowed smoothing reference (not owned — CanvasRenderer handles lifecycle)
+    this._smoothing = null;
 
     // Clean up BFI frame history resources
     for (const tex of this._historyTextures) gl.deleteTexture(tex);
@@ -432,7 +444,7 @@ export class CRTDisplay {
 
     // Bind source texture as READ: RGSS intermediate when smoothing active, else raw ready
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this._srcFbo);
-    const srcTex = smoothingActive ? this._smoothing.getSmoothedTexture() : this._getReadyTexture();
+    const srcTex = smoothingActive ? this._smoothing!.getSmoothedTexture() : this._getReadyTexture();
     gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, srcTex, 0);
 
     // Bind current history slot as DRAW target
