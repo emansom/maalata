@@ -31,7 +31,8 @@
  * - Every effect block guarded by `> 0.0001` threshold check for early-out.
  * - Pixel beam (Gaussian CRT phosphor dots) replaced both sin-based scanlines
  *   and mod-based dot mask — matches real CRT physics where beam cross-section
- *   creates both pixel shapes and scanline gaps as a single effect.
+ *   creates both pixel shapes and scanline gaps as a single effect. Pixel art
+ *   scale auto-detected per-fragment from texture color boundaries.
  * - Vignette from gingerbeardman added as part of the combined lighting mask.
  * - gingerbeardman's 5-tap bloom intentionally NOT adopted (4 extra texture
  *   reads per fragment); current smoothstep glow is much cheaper.
@@ -97,7 +98,7 @@ export const CRT_VERTEX_SRC = `
  *  7. Glow/bloom (linear, adjusted threshold)
  *  8. Signal loss (linear)
  *  9. Lighting mask: flicker + vignette (linear)
- * 10. Pixel beam: 2D Gaussian CRT phosphor dot simulation
+ * 10. Pixel beam: 2D Gaussian CRT phosphor dot, per-region scale auto-detection
  * 11. Encode with display gamma (2.2, sRGB)
  * 12. Color: desaturation → contrast → brightness (perceptual)
  */
@@ -311,32 +312,63 @@ export const CRT_FRAGMENT_SRC = `
 
     col *= mask;
 
-    // --- 10. Pixel beam (Gaussian CRT phosphor dot simulation) ---
+    // --- 10. Pixel beam (Gaussian CRT phosphor dot, per-region auto-detection) ---
     // Replaces both the sin-based scanlines and mod-based dot mask with a
     // unified 2D Gaussian beam model. On a real CRT, the electron beam has
     // a Gaussian cross-section that creates both the pixel dot shape AND the
     // scanline gaps — they are the same physical effect.
     //
-    // Virtual CRT pixel grid: beamScale canvas pixels per CRT dot.
-    // Auto-derived from canvas height: targets ~180 dots vertically above
-    // 540p, minimum 3px/dot below 540p for visible roundness.
+    // For each fragment, search up/down/left/right in the raw texture to
+    // find the uniform-color block this texel belongs to. This detects
+    // pixel art that has been scaled up by any factor (2x-8x) and adapts
+    // the beam to match, even when different canvas regions use different
+    // scale factors.
     //
-    // Brightness-dependent beam width (CRT physics): higher beam current
-    // excites a wider phosphor area. Inspired by CRT-Geom (cgwg) beam
-    // profile and CRT-Royale brightness-dependent sigma.
+    // Cost: up to 33 texture reads (1 center + 8x4 directions), reduced
+    // by early-out at color boundaries. Interior of 4x art: ~17 reads.
+    // 1x content or edges: ~5 reads.
     //
     // u_inputSize.y < 1.0 bypasses the beam (used by verify-demo tests
     // that need a clean signal for gamma/passthrough measurements).
     if (u_inputSize.y > 0.5) {
-      float beamScale = max(3.0, u_inputSize.y / 180.0);
+      vec2 texel = 1.0 / u_inputSize;
+      vec3 ref = texture2D(u_texture, uv).rgb;
 
-      // Position in virtual CRT pixel grid
-      vec2 crtCoord = uv * u_inputSize / beamScale;
-      vec2 center = floor(crtCoord) + 0.5;
-      vec2 dist = crtCoord - center;  // [-0.5, 0.5] from CRT pixel center
+      float dUp = 0.0;
+      for (int i = 1; i <= 8; i++) {
+        vec2 s = uv - vec2(0.0, float(i) * texel.y);
+        if (s.y < 0.0 || distance(texture2D(u_texture, s).rgb, ref) > 0.02) break;
+        dUp += 1.0;
+      }
+      float dDown = 0.0;
+      for (int i = 1; i <= 8; i++) {
+        vec2 s = uv + vec2(0.0, float(i) * texel.y);
+        if (s.y > 1.0 || distance(texture2D(u_texture, s).rgb, ref) > 0.02) break;
+        dDown += 1.0;
+      }
+      float dLeft = 0.0;
+      for (int i = 1; i <= 8; i++) {
+        vec2 s = uv - vec2(float(i) * texel.x, 0.0);
+        if (s.x < 0.0 || distance(texture2D(u_texture, s).rgb, ref) > 0.02) break;
+        dLeft += 1.0;
+      }
+      float dRight = 0.0;
+      for (int i = 1; i <= 8; i++) {
+        vec2 s = uv + vec2(float(i) * texel.x, 0.0);
+        if (s.x > 1.0 || distance(texture2D(u_texture, s).rgb, ref) > 0.02) break;
+        dRight += 1.0;
+      }
+
+      // Block dimensions in canvas pixels
+      vec2 blockSize = vec2(dLeft + dRight + 1.0, dUp + dDown + 1.0);
+
+      // Fragment's normalized distance from block center: [-0.5, 0.5]
+      vec2 dist = vec2(
+        (dLeft - (blockSize.x - 1.0) * 0.5) / blockSize.x,
+        (dUp   - (blockSize.y - 1.0) * 0.5) / blockSize.y
+      );
 
       // Brightness-dependent beam width
-      // lum=0: σ=0.21 (tight dot), lum=1: σ=0.44 (broad, gaps nearly filled)
       float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
       float sigma = 0.35 * (0.6 + 0.65 * sqrt(lum));
 
