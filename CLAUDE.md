@@ -58,7 +58,7 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 - **CRT as overlay**: `CRTDisplay` takes over the display loop on the same GL context, reading from `getReadyTexture()`.
 - **Idle shutdown**: Stop CRT/passthrough RAF loop. `preserveDrawingBuffer: true` keeps last frame visible. Resume = restart RAF.
 - **esbuild `mangleProps: /^_/`**: All `_`-prefixed properties are renamed in production. Cross-file methods must NOT use `_` prefix. Each package mangles independently.
-- **Pixel beam (Gaussian CRT phosphor dots)**: Step 10 renders each virtual CRT pixel as a 2D Gaussian with brightness-dependent width. Replaces both the sin-based scanlines and mod-based dot mask — on real CRTs, scanline gaps were created by the beam's vertical profile (same physical effect as horizontal dot shaping). Pixel art scale is auto-detected per-fragment from texture color boundaries (searches up/down/left/right, max 8 texels each). Handles varying scales across the canvas without config. Always active.
+- **Pixel beam (Gaussian CRT phosphor dots)**: Step 10 renders each virtual CRT pixel as a 2D Gaussian with brightness-dependent width. Replaces both the sin-based scanlines and mod-based dot mask — on real CRTs, scanline gaps were created by the beam's vertical profile (same physical effect as horizontal dot shaping). Auto-derived from canvas size: `beamScale = max(3.0, height/180)`. No CRTConfig fields; always active.
 - **CRT colorspace (BT.1886 → sRGB)**: Shader decodes with γ=2.4 (BT.1886 CRT phosphor response), processes effects in linear space, encodes with γ=2.2 (sRGB). Net gamma 1.09 = authentic CRT contrast. No color primary conversion needed (PC P22 phosphors ≈ sRGB). WebGL RGBA textures have no hardware sRGB — all gamma is manual via `pow()`. See `crt-shaders.ts` file header for full rationale.
 
 ### Renderer events
@@ -76,10 +76,6 @@ Standalone project with demo as a child npm workspace. Depends on canvas-ultrafa
 ### Build output
 
 maalata produces ES + UMD formats with `.d.ts` declarations via `vite-plugin-dts`. Filenames include a per-build content hash. maalata externalizes canvas-ultrafast (not bundled into its output).
-
-## Policies
-
-- **No backwards compatibility**: Breaking changes are acceptable for better features, maintainability, or functionality. Do not preserve deprecated APIs, add compatibility shims, or avoid removing old code. Clean breaks are preferred over gradual deprecation.
 
 ### Demo project
 

@@ -40,7 +40,7 @@ const DEMO = {
   name: 'maalata',
   distDir: resolve(import.meta.dirname, '../demo/dist'),
   port: 4173,
-  cpuThreshold: 45.0,  // CRT shader inflates CPU on SwiftShader (beam detection adds up to 33 texture reads/fragment)
+  cpuThreshold: 15.0,  // CRT shader inflates CPU on SwiftShader
   settleMs: 2000,       // pipeline needs time to flush first frames
 };
 
@@ -526,22 +526,20 @@ async function main() {
       }
     }
 
-    // --- Unit test: Pixel beam (per-region auto-detection) ---
-    console.log(`\n${tag} Unit: Pixel beam (block detection)...`);
+    // --- Unit test: Pixel beam darkening ---
+    console.log(`\n${tag} Unit: Pixel beam darkening...`);
     {
       // Enable beam (default canvas size) with CRT gamma 2.4/2.2
       await applyConfigAndRender(page, { ...NEUTRAL_CRT, crtGamma: 2.4, _inputSize: null });
-      // Sample white bar — beam uses per-fragment block detection. Large
-      // uniform regions (like SMPTE bars) have interior fragments at block
-      // center (dist≈0), so the Gaussian evaluates to ~1.0 (no darkening).
-      // This is correct: the beam only creates phosphor dot patterns at
-      // detected pixel-art boundaries. The gamma net effect (2.4/2.2)
-      // produces the slight darkening visible here.
+      // Sample white bar — beam Gaussian profile darkens averaged pixels
       const color = await sampleRegionColor(page, BARS_X, BARS_Y, BAR_W, BARS_H);
       const avg = (color.r + color.g + color.b) / 3;
-      console.log(`${tag}   White bar avg: ${avg.toFixed(0)} (expected 200–255, beam active, large uniform block)`);
-      if (avg > 255 || avg < 200) {
-        const msg = `[Unit beam] White bar average ${avg.toFixed(0)}, expected 200–255 (large uniform block, minimal beam darkening)`;
+      // White bar with beam: bright pixels have wide sigma (~0.44) but still
+      // darken significantly due to Gaussian falloff near cell edges.
+      // Average should be well below 255 but above 50.
+      console.log(`${tag}   White bar avg: ${avg.toFixed(0)} (expected 50–230, beam active)`);
+      if (avg > 230 || avg < 50) {
+        const msg = `[Unit beam] White bar average ${avg.toFixed(0)}, expected 50–230 (beam should darken)`;
         errors.push(msg);
         console.error(`${tag} ${msg}`);
       }
